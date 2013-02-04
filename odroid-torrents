@@ -26,7 +26,7 @@ my @trackers = (
   "udp://denis.stalker.h3q.com:6969/announce",
   "udp://fr33domtracker.h33t.com:3310/announce",
   "http://fr33dom.h33t.com:3310/announce",
-  "http://www.sumotracker.com/announce"
+  "http://www.sumotracker.com/announce",
   "http://open.tracker.thepiratebay.org/announce",
 );
 
@@ -34,10 +34,12 @@ my @trackers = (
 use constant BTMAKEMETAFILE => '/usr/bin/btmakemetafile';
 use constant TRANSMISSION   => '/usr/bin/transmission-remote';
 
-use constant XMISSIONDEFPASS  => 'transmission:transmission';
+# if there's no password file for transmission, we will fall back to
+# trying the default password
 use constant XMISSIONPASSFILE => '/home/torrent/.transmission-netrc';
+use constant XMISSIONDEFPASS  => 'transmission:transmission';
 
-
+# Required modules
 use Cwd qw(abs_path);
 use File::Path qw(make_path);
 use File::Find;
@@ -62,7 +64,8 @@ BEGIN {
     # the getfattr routine emits a warning in cases other than the
     # file not having a particular attribute. I'm assuming that this
     # includes the case where extended attributes aren't supported on
-    # that file.
+    # that file. (update: getfattr doesn't seem to work like this, so
+    # I'm using setfattr instead)
 
     # we'll test if the source (seed) directory can have attributes,
     # but only if that dir exists.
@@ -101,6 +104,33 @@ BEGIN {
   }
 }
 
+# Helper function to grab all the odroid.* extended attributes.
+# returns a (possibly empty) hash of values
+sub read_xattrs {
+
+  my $file = shift;
+  my $hashref = {};
+
+  return $hashref unless $xattr_support;
+
+  unless (-f $file) {
+    warn "read_xattrs: file $file doesn't exist!\n";
+    return $hashref;
+  }
+
+  foreach (listfattr($file)) {
+    # only look up odroid.* tags
+    next unless XATTRTAG eq substr $_, $[, $[ + length XATTRTAG;
+    my $value = getfattr($file, $_);
+    # as a convenience, strip out odroid. prefix before saving
+    substr ($_, $[, $[ + length XATTRTAG) = '';
+    $hashref->{$_} = $value;
+  }
+
+  return $hashref;
+
+}
+
 
 # By default make_torrent_file will create the output torrent file in
 # the same directory as the input file and apply a "Downloaded from
@@ -117,7 +147,7 @@ sub make_torrent_file {
   die "make_torrent_file needs an infile => value parameter"
     unless defined $o{infile};
 
-  die "make_torrent_file: file '$o{infile} doesn't exist\n" 
+  die "make_torrent_file: file '$o{infile} doesn't exist\n"
     unless -f $o{infile};
 
   die "make_torrent_file asked to operate on .torrent file"
@@ -127,7 +157,7 @@ sub make_torrent_file {
   # infile is in the source tree since I'm not sure how constants are
   # supposed to with with regexp. Substr should be more efficient
   # anyhow.
-  unless(SRCROOT eq substr $o{infile}, $[, length SRCROOT) {
+  unless(SRCROOT eq substr $o{infile}, $[, $[ + length SRCROOT) {
     die "make_torrent_file was given a file " . $o{infile} .
       " outside source tree";
   }
@@ -155,6 +185,40 @@ sub make_torrent_file {
 
   system @cmd;
 
+  # if we have extended attribute support, save some metadata about
+  # the original file using them. Note that I'm storing the mtime in
+  # this way rather than simply changing the mtime of the torrent file
+  # to match the original file since I want the torrent's mtime to
+  # reflect when I created it.
+  if ($xattr_support) {
+    my ($size,$mtime) = (stat $o{infile})[7,9];
+
+    # tags to put on output file
+    my %otags = (
+		mtime => $mtime,
+		size  => $size,
+	       );
+
+    # scan the original (input) file for any stored attributes
+    my $itags = read_xattrs($o{infile});
+
+    # copy the md5 hash if it's not out of date (ie, file isn't newer)
+    if (exists $itags->{"md5.hash"}) {
+      if (exists $itags->{"md5.ts"}) {
+	if ($mtime < $itags->{"md5.ts"}) {
+	  $otags{md5sum} = $itags->{"md5.hash"};
+	} else {
+	  warn "make_torrent_file: $o{infile}: stale md5 hash\n";
+	}
+      } else {
+	warn "make_torrent_file: $o{infile}: missing md5 timestamp\n";
+      }
+    }
+
+    while (my ($k,$v) = each %otags) {
+      setfattr($o{outfile}, XATTRTAG . "sourceinfo.$k", $v);
+    }
+  }
 }
 
 # publish_torrent has several different modes:
@@ -178,12 +242,12 @@ sub publish_torrent {
 
   my $source = abs_path($o{file});
 
-  unless(SRCROOT eq substr $source, $[, length SRCROOT) {
+  unless(SRCROOT eq substr $source, $[, $[ + length SRCROOT) {
     die "publish_torrent: $o{file}: not in the source tree";
   }
 
   my $target = $source;
-  substr ($target, $[, length SRCROOT) = WEBROOT;
+  substr ($target, $[, $[ + length SRCROOT) = WEBROOT;
 
   if ($o{mode} eq "target") {
     return $target;
@@ -226,9 +290,9 @@ sub start_torrent {
 
   my $absfile = abs_path($file);
 
-  if (SRCROOT eq substr $absfile, $[, length SRCROOT) {
-    substr ($absfile, $[, length SRCROOT) = WEBROOT;
-  } elsif (WEBROOT ne substr $absfile, $[, length WEBROOT) {
+  if (SRCROOT eq substr $absfile, $[, $[ + length SRCROOT) {
+    substr ($absfile, $[, $[ + length SRCROOT) = WEBROOT;
+  } elsif (WEBROOT ne substr $absfile, $[, $[ + length WEBROOT) {
     die "start_torrent: $file must be within source or web dirs\n";
   }
 
@@ -244,7 +308,7 @@ sub start_torrent {
   }
 
   my $download_dir = $absfile;
-  substr ($download_dir, $[, length WEBROOT) = SRCROOT;
+  substr ($download_dir, $[, $[ + length WEBROOT) = SRCROOT;
   $download_dir =~ s|(.*)/.*|$1|;
 
   # If we don't have the file locally, we may need to make a download
