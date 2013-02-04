@@ -1,0 +1,484 @@
+#!/usr/bin/perl
+#
+# Script to manage my Odroid software mirror and associated torrent
+# files.
+#
+
+use strict;
+use warnings;
+
+use constant WEBROOT => "/var/www/torrents/dn.odroid.com";
+use constant SRCROOT => "/home/torrent/torrents/dn.odroid.com";
+
+use constant WGETPIDFILE => "/home/torrent/.odroid_wget_pid";
+
+use constant ODROIDROOTURL => "http://dn.odroid.com";
+
+use constant XATTRTAG => "otorrent.";
+
+my @trackers = (
+  "udp://tracker.publicbt.com:80/announce",
+  "http://tracker.publicbt.com:80/announce",
+  "udp://tracker.openbittorrent.com:80/announce",
+  "http://tracker.openbittorrent.com:80/announce",
+  "http://www.torrent-downloads.to:2710/announce",
+  "http://denis.stalker.h3q.com:6969/announce",
+  "udp://denis.stalker.h3q.com:6969/announce",
+  "udp://fr33domtracker.h33t.com:3310/announce",
+  "http://fr33dom.h33t.com:3310/announce",
+  "http://www.sumotracker.com/announce"
+  "http://open.tracker.thepiratebay.org/announce",
+);
+
+# external programs follow
+use constant BTMAKEMETAFILE => '/usr/bin/btmakemetafile';
+use constant TRANSMISSION   => '/usr/bin/transmission-remote';
+
+use constant XMISSIONDEFPASS  => 'transmission:transmission';
+use constant XMISSIONPASSFILE => '/home/torrent/.transmission-netrc';
+
+
+use Cwd qw(abs_path);
+use File::Path qw(make_path);
+use File::Find;
+use File::Copy;
+use Digest::MD5;
+
+# The following is intended to test whether we have support for
+# extended attributes. I'm leaning more and more towards making xattr
+# support mandatory, but since there are still some things that the
+# script can do without it (and since the code below is useful) I'm
+# leaving the checks in here.
+my $xattr_support;
+
+BEGIN {
+  $xattr_support = 0;
+  if ( eval { require File::ExtAttr } ) {
+    File::ExtAttr->import(':all');
+
+    # the module is loaded now as if we'd done 'use File::ExtAttr',
+    # but we have to check whether the filesystem actually supports
+    # extended attributes. The man page for the module suggests that
+    # the getfattr routine emits a warning in cases other than the
+    # file not having a particular attribute. I'm assuming that this
+    # includes the case where extended attributes aren't supported on
+    # that file.
+
+    # we'll test if the source (seed) directory can have attributes,
+    # but only if that dir exists.
+    unless (-d SRCROOT) {
+      warn "$0: Seed dir doesn't exist! This script needs one!\n";
+    } else {
+
+      eval {
+	# promote warning into full die. Sets $@
+	local $SIG{__WARN__} = sub { die $_[0] };
+
+	# apparently getfattr (or the external attr command) doesn't
+	# throw any warning, even on files like those in /proc or
+	# /sys. That can't be right, so I'll use setfattr instead
+	# getfattr ("/sys/block", "anything"); # no warning?!
+
+	# my $testfile = "/proc/uptime"; # tested OK, raised warning
+	my $testfile = SRCROOT;
+	if (setfattr ($testfile, "user.testxattr", "any value")) {
+	  delfattr($testfile,"user.testxattr");
+	} else {
+	  # this warn is promoted to a die thanks to our sig handler
+	  warn "Unable to set test attribute on $testfile\n";
+	}
+      };
+
+      # eval sets $@ if the eval block died
+      if ($@) {
+	# my $device = (stat SRCROOT)[0]; # != device *file*; no use
+	warn "$0: seed dir doesn't seem to support ext. attributes: $@\n";
+      } else {
+	# warn "$0: Ext. attribute supported! Results caching enabled\n";
+	++$xattr_support;
+      }
+    }
+  }
+}
+
+
+# By default make_torrent_file will create the output torrent file in
+# the same directory as the input file and apply a "Downloaded from
+# <url>" comment (which can be overridden)
+sub make_torrent_file {
+
+  my %o = (
+	   infile => undef,	# required
+	   comment => "default",
+	   outfile => undef,
+	   @_
+	  );
+
+  die "make_torrent_file needs an infile => value parameter"
+    unless defined $o{infile};
+
+  die "make_torrent_file: file '$o{infile} doesn't exist\n" 
+    unless -f $o{infile};
+
+  die "make_torrent_file asked to operate on .torrent file"
+    if $o{infile} =~ /\.torrent$/i;
+
+  # using substr instead of regular expression to make sure that
+  # infile is in the source tree since I'm not sure how constants are
+  # supposed to with with regexp. Substr should be more efficient
+  # anyhow.
+  unless(SRCROOT eq substr $o{infile}, $[, length SRCROOT) {
+    die "make_torrent_file was given a file " . $o{infile} .
+      " outside source tree";
+  }
+
+  # build up command based on default invocation plus input options
+  my $primary_tracker = $trackers[0];
+  my $alt_trackers    = join "|", @trackers;
+
+  my @cmd = (BTMAKEMETAFILE, $primary_tracker, $o{infile},
+	    "--announce_list", $alt_trackers);
+
+  $o{outfile} = $o{infile} . ".torrent" unless defined $o{outfile};
+
+  if (defined $o{comment}) {
+
+    if ($o{comment} eq "default") {
+      my $source_url = ODROIDROOTURL . substr $o{infile},$[ + length SRCROOT;
+      $o{comment} = "Downloaded from $source_url";
+    }
+
+    push @cmd, "--comment", $o{comment};
+  }
+
+  push @cmd, "--target", $o{outfile};
+
+  system @cmd;
+
+}
+
+# publish_torrent has several different modes:
+# force   ->  copy the torrent into the www directory unconditionally
+# update  ->  copy torrent if it is newer than file in www dir
+# target  ->  report the target filename in www, but do nothing
+sub publish_torrent {
+
+  my %o = (
+	   file => undef,
+	   mode => "update",
+	   @_
+	  );
+
+  die "publish_torrent needs a file => var option" unless defined $o{file};
+
+  unless ($o{file} =~ /\.torrent$/) {
+    warn "publish_torrent: using '$o{file}.torrent' instead of $o{file}\n";
+    $o{file} .= ".torrent";
+  }
+
+  my $source = abs_path($o{file});
+
+  unless(SRCROOT eq substr $source, $[, length SRCROOT) {
+    die "publish_torrent: $o{file}: not in the source tree";
+  }
+
+  my $target = $source;
+  substr ($target, $[, length SRCROOT) = WEBROOT;
+
+  if ($o{mode} eq "target") {
+    return $target;
+  } elsif ($o{mode} eq "update") {
+    if (-f $target) {
+      my $source_mtime = (stat $source)[9];
+      my $target_mtime = (stat $target)[9];
+      return if $target_mtime >= $source_mtime;
+    }
+  } elsif ($o{mode} ne "force") {
+    die "publish_torrent: unknown mode $o{mode}";
+  }
+
+  # make target directory if it doesn't exist
+  my $target_dir = $target;
+  $target_dir =~ s|(.*)/.*|$1|;
+  make_path ($target_dir, { mode => 0775 }) unless -d $target_dir;
+
+  copy($source,$target) or
+    die "publish_torrent: copy $source, $target failed: $!\n";
+
+}
+
+# The best torrent downloader I've used seems to be Transmission. The
+# most important feature is that it can store the seed/download files
+# in a separate place to the torrent, so it makes it easy to set up
+# parallel directory structures for torrent files and the
+# downloads. Also, it has a very fully-featured server/client mode of
+# operation that makes it easy to program.
+
+# We only torrent files that are in the www directory, but we allow
+# some latitude in specifying them. In particular, if we're in our
+# local storage directory and we specify a file or a torrent file then
+# we convert that into the correct .torrent file in the www dir.
+sub start_torrent {
+
+  my $file = shift;
+
+  $file .= ".torrent" unless $file =~ /.torrent$/i;
+
+  my $absfile = abs_path($file);
+
+  if (SRCROOT eq substr $absfile, $[, length SRCROOT) {
+    substr ($absfile, $[, length SRCROOT) = WEBROOT;
+  } elsif (WEBROOT ne substr $absfile, $[, length WEBROOT) {
+    die "start_torrent: $file must be within source or web dirs\n";
+  }
+
+  unless (-f $absfile) {
+    if (-f $file) {
+      warn "start_torrent: did not find $absfile " .
+	"(did you forget to publish?)\n";
+    } else {
+      warn "start_torrent: did not find $absfile " .
+	"(not in source tree either)\n";
+    }
+    return;
+  }
+
+  my $download_dir = $absfile;
+  substr ($download_dir, $[, length WEBROOT) = SRCROOT;
+  $download_dir =~ s|(.*)/.*|$1|;
+
+  # If we don't have the file locally, we may need to make a download
+  # dir for it.
+  unless (-d $download_dir) {
+    warn "start_torrent: creating download dir $download_dir\n";
+    make_path($download_dir, { mode => 0775 })
+      or die "failed to make_path $download_dir\n";
+  }
+
+  my @command = (TRANSMISSION, "--download-dir", $download_dir);
+
+  # do we have a password file or will we use default user/pass?
+  if (-f XMISSIONPASSFILE) {
+    push @command, "--netrc", XMISSIONPASSFILE;
+  } else {
+    push @command, "--auth", XMISSIONDEFPASS;
+  }
+
+  # it seems that we have to set the download path separately from
+  # doing the add ...
+  system @command;
+
+  # shift @command; shift @command; unshift @command, TRANSMISSION;
+
+  push @command, "--add", $absfile;
+
+  warn "Executing: " . (join " ", @command) . "\n";
+  system @command;
+
+}
+
+sub stop_torrent {
+
+}
+
+# Returns a list of all the files we're currently downloading or
+# seeding.  Alternatively, if it's given an argument, it tells if
+# we're currently torrenting that.
+sub list_torrents {
+
+}
+
+
+# check_file attempts to detect errors in a file based on its file
+# extension. If there is a corresponding md5 hash file it checks
+# against that, too. Since all of these checks involve reading the
+# whole file in (which can take a while) it caches the results by
+# storing it as an extended attribute of the file (if we have extended
+# attribute support).
+my $xattr_support_warning = 0;
+sub check_file {
+
+  # warn once about not being able to cache results
+  unless ($xattr_support_warning ++) {
+    warn "No xattr support; check_file can't cache results\n";
+  }
+
+  my $check_method = undef;
+  my @check_command = ();
+
+  
+
+}
+
+
+# Since I've discovered that I don't have enough space on my VPS to
+# mirror the entire odroid download site, I have to be able to
+# selectively delete files. However, there are some provisos and other
+# points of interest:
+#
+# * I still want to be able to make torrent files for the files, even
+#   if I won't be able to seed them
+#
+# * Before deleting files (actually, truncating them and making them
+#   unwriteable) I want to check that it's safe to do so (ie, the file
+#   checks out OK and I have an up-to-date torrent file created, along
+#   with hash information)
+#
+# * I need to be able to store all the full file's vital-statistics
+#   (previous size, hash, mtime, download time and the file's info
+#   hash) in the file's extended attributes
+#
+# * I need to prevent downloading the file again if it's marked as
+#   deleted in this way. Likewise, I need to make sure that I don't
+#   start seeding from the file
+#
+# * If I'm currently seeding, I need to stop seeding before deleting
+#
+# * It would be nice to have some way of passing information about
+#   what files I'm actually seeding over to the web server.
+#
+# * I probably need a way to undo the delete, or at least provide a
+#   mechanism so that if I get more storage later, I can unmark the
+#   file and start downloading it again. In that case, it would be
+#   nice to be able to keep previous vital-statistics around at least
+#   until the new download finished. Renaming the file to something
+#   else would work fine (say ".filename"), but obviously it adds more
+#   complexity when it comes to checking the new download at this
+#   point.
+#
+# * I have several files that I know didn't download properly. I want
+#   to include the option of checking files locally (with check_file)
+#   but it would be good to also be able to check things like file
+#   sizes and mtimes against the originals.
+#
+
+
+
+# yes, it's probably bad style to use the ARGV global from within a
+# sub like this...
+sub do_test {
+
+  my $what = shift or die "Test what?";
+
+  if ($what eq "make") {
+    my $testfile = shift @ARGV or die "Gotta gimme somethin'";
+    make_torrent_file(infile=>abs_path($testfile));
+
+  }
+}
+
+#
+# Download management
+#
+# Running an external wget command to make a (partial) mirror of the
+# odroid site isn't an option for me since wget would try to
+# re-download all the files that I want deleted (or die because it
+# can't write to the zero-length files that I keep in their place). As
+# a result, I need to replicate some of the features of wget here. The
+# two main features I need are to scrape URLs from HTML documents (so
+# I can recursively find what needs to be downloaded) and to be able
+# to resume downloads. I also want to be able to get info about a URL,
+# in particular its modification time.
+#
+# As far as download management itself goes, I'd like to have the
+# option of running one or more downloads in the background. In order
+# to avoid problems with concurrent access and the like, as well as
+# having a "database" of which downloads are active, I'd again use
+# extended attributes. Something like this, maybe:
+#
+# otorrent.status
+#
+# set to "complete", "download(ing)" or "ignore" (ie, deleted or don't
+# want)
+#
+# otorrent.source
+#
+# set to "torrent" or "mirror" to indicate where we got/we want to get
+# the file from. Later on, I could see myself wanting to download via
+# torrents, but probably only on another machine.
+#
+# otorrent.sourceinfo.*
+#
+# various metadata about the source file (eg, torrent name in the case
+# of torrents and mtime, size, last visited, etc. in the case of
+# mirrored files)
+#
+# otorrent.*
+#
+# various other local metadata (eg, last download time, md5 digest)
+
+#warn "xattr_support? $xattr_support\n";
+
+
+my $prog = $0; $prog =~ s|.*/||;
+my $usage = <<EOT;
+$prog: Manage ODROID torrent mirror
+Usage:
+
+$prog mirror (file|dir)
+
+  Download (updated) file contents from ODROID site
+
+$prog check (file|dir)
+
+  Check integrity of files in local mirror
+
+$prog make (file|dir)
+
+  Create .torrent files
+
+$prog publish (file.torrent|dir)
+
+  Copy torrents into www directory
+
+$prog start (file.torrent|dir)
+
+  Join the torrent network to download or seed files
+
+$prog (pause|unpause) (file.torrent|dir)
+
+  Pause or unpause particular torrent files (won't work.. use the
+  transmission-remote command directly)
+
+$prog stop (file.torrent|dir)
+
+  Stop torrenting files (won't work.. use the transmission-remote
+  command directly)
+
+$prog list
+
+  Shows a list of all current torrents
+
+EOT
+
+# set umask to allow creation of files/dirs that users in our group
+# can write to
+
+umask 0002;
+
+my $command = shift @ARGV;
+
+die $usage unless defined $command;
+
+if ($command eq "make") {
+
+  make_torrent_file(infile => abs_path(shift @ARGV));
+
+} elsif ($command eq "publish") {
+
+  publish_torrent(file => shift @ARGV);
+
+} elsif ($command eq "start") {
+
+  start_torrent(shift @ARGV);
+
+} elsif ($command eq "list") {
+
+  my @command = (TRANSMISSION, "--netrc", XMISSIONPASSFILE, "-l");
+
+  exec @command;
+
+} else {
+
+  die "Unknown command: $command\n";
+}
