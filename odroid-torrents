@@ -449,7 +449,6 @@ sub check_file {
 
 }
 
-
 # Since I've discovered that I don't have enough space on my VPS to
 # mirror the entire odroid download site, I have to be able to
 # selectively delete files. However, there are some provisos and other
@@ -592,6 +591,12 @@ $prog list
 
   Shows a list of all current torrents
 
+$prog xtracker
+
+  Tell transmission to use our current tracker list for all active
+  torrents. This lets you continue seeding even if the torrent files
+  have been changed to include new tracker info.
+
 EOT
 
 # set umask to allow creation of files/dirs that users in our group
@@ -628,6 +633,23 @@ if ($command eq "make") {
   my @command = (TRANSMISSION, "--netrc", XMISSIONPASSFILE, "-l");
 
   exec @command;
+
+} elsif ($command eq "xtracker") {
+
+  # apparently transmission-remote doesn't like adding duplicate
+  # trackers, and neither does it have an option to delete all
+  # trackers. As a result, I'll just run the add and suppress any
+  # warnings.
+
+  foreach (@trackers) {
+
+    # next if /^udp:/i;
+
+    my $cmd = TRANSMISSION. " --netrc ". XMISSIONPASSFILE.
+      " -t all --tracker-add $_";
+
+    `$cmd `;			# `$cmd 2>/dev/null`;
+  }
 
 } else {
 
