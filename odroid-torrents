@@ -104,7 +104,7 @@ BEGIN {
   }
 }
 
-# Helper function to grab all the odroid.* extended attributes.
+# Helper function to grab all the otorrent.* extended attributes.
 # returns a (possibly empty) hash of values
 sub read_xattrs {
 
@@ -114,7 +114,7 @@ sub read_xattrs {
   return $hashref unless $xattr_support;
 
   unless (-f $file) {
-    warn "read_xattrs: file $file doesn't exist!\n";
+    warn "read_xattrs: $file doesn't exist!\n";
     return $hashref;
   }
 
@@ -131,6 +131,24 @@ sub read_xattrs {
 
 }
 
+sub write_xattrs {
+
+  my $file = shift;
+  my %hash = @_;
+
+  return unless $xattr_support;
+
+  unless (-f $file) {
+    warn "write_xattrs: $file doesn't exist!\n";
+    return;
+  }
+
+  # we put back in the "otorrent." prefix when writing
+  while (my ($k,$v) = each %hash) {
+    setfattr($file, XATTRTAG . "$k", $v);
+  }
+
+}
 
 # By default make_torrent_file will create the output torrent file in
 # the same directory as the input file and apply a "Downloaded from
@@ -195,29 +213,38 @@ sub make_torrent_file {
 
     # tags to put on output file
     my %otags = (
-		mtime => $mtime,
-		size  => $size,
-	       );
+		 mtime => $mtime,
+		 size  => $size,
+		);
 
     # scan the original (input) file for any stored attributes
     my $itags = read_xattrs($o{infile});
 
+    foreach (keys %$itags) {
+      print "input tag $_ => '" . $itags->{$_} . "'\n";
+    }
+
     # copy the md5 hash if it's not out of date (ie, file isn't newer)
     if (exists $itags->{"md5.hash"}) {
       if (exists $itags->{"md5.ts"}) {
-	if ($mtime < $itags->{"md5.ts"}) {
+	if ($mtime <= $itags->{"md5.ts"}) {
 	  $otags{md5sum} = $itags->{"md5.hash"};
 	} else {
 	  warn "make_torrent_file: $o{infile}: stale md5 hash\n";
+	  warn "mtime of file $mtime > md5 timestamp ".$itags->{"md5.ts"}."\n";
 	}
       } else {
 	warn "make_torrent_file: $o{infile}: missing md5 timestamp\n";
       }
     }
 
-    while (my ($k,$v) = each %otags) {
-      setfattr($o{outfile}, XATTRTAG . "sourceinfo.$k", $v);
+    # output tags prefixed with "sourceinfo."
+    foreach (keys %otags) {
+      $otags{"sourceinfo.$_"} = $otags{$_};
+      delete $otags{$_};
     }
+
+    write_xattrs($o{outfile}, %otags);
   }
 }
 
@@ -268,6 +295,7 @@ sub publish_torrent {
 
   copy($source,$target) or
     die "publish_torrent: copy $source, $target failed: $!\n";
+
 
 }
 
