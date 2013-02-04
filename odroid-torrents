@@ -32,6 +32,7 @@ my @trackers = (
 
 # external programs follow
 use constant BTMAKEMETAFILE => '/usr/bin/btmakemetafile';
+use constant BTSHOWMETAFILE => '/usr/bin/btshowmetainfo';
 use constant TRANSMISSION   => '/usr/bin/transmission-remote';
 
 # if there's no password file for transmission, we will fall back to
@@ -238,10 +239,48 @@ sub make_torrent_file {
       }
     }
 
-    # output tags prefixed with "sourceinfo."
+    # rename tags to be prefixed with "sourceinfo."
     foreach (keys %otags) {
       $otags{"sourceinfo.$_"} = $otags{$_};
       delete $otags{$_};
+    }
+
+    # saving the info hash of the torrent will be very useful later
+    # when it comes to pausing or unseeding a torrent since
+    # transmission-remote uses them to identify particular torrents.
+
+    # using a forking recipe is needed to safeguard against possible
+    # shell escapes with basic open(HANDLE, "prog args |") form.
+    my ($pid,$info_hash)=();
+    die "Can't fork: $!"
+      unless defined($pid = open CHILD, "-|");
+    if ($pid) {			# parent process
+      while (<CHILD>) {
+	#print "parsing: $_\n";
+	if (/^info hash.*:\s(\S+)/) {
+	  $info_hash = $1;
+	  last;
+	}
+      }
+      close CHILD or warn "child exited $?";
+    } else {			# child process
+      #warn "child about to exec " . BTSHOWMETAFILE. " $o{outfile}\n";
+      die "Can't exec " . BTSHOWMETAFILE . "\n" unless
+	exec BTSHOWMETAFILE, $o{outfile};
+    }
+
+    if (defined($info_hash)) {
+      #warn "got info_hash: $info_hash\n";
+      $otags{"torrent.info_hash"} = $info_hash;
+
+      # also save this info with the source file
+      warn "make_torrent_file: failed to save info hash to $o{infile}\n"
+	unless setfattr ($o{infile}, XATTRTAG . "torrent.info_hash",
+			 $info_hash)
+
+    } else {
+      warn "make_torrent_file: couldn't find info hash in " .
+	BTSHOWMETAFILE . " output\n";
     }
 
     write_xattrs($o{outfile}, %otags);
@@ -364,7 +403,10 @@ sub start_torrent {
   # doing the add ...
   system @command;
 
-  # shift @command; shift @command; unshift @command, TRANSMISSION;
+  # prune the command to get rid of the duplicate --download-dir
+  @command = @command[$[,$[+3 .. $#command];
+  # another way of doing the above:
+  #shift @command; shift @command; unshift @command, TRANSMISSION;
 
   push @command, "--add", $absfile;
 
