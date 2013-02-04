@@ -439,7 +439,7 @@ sub check_file {
   # warn once about not being able to cache results
   unless ($xattr_support_warning ++) {
     warn "No xattr support; check_file can't cache results\n"
-      unless $xattr_support_warning
+      unless $xattr_support;
   }
 
   my $check_method = undef;
