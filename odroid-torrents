@@ -162,14 +162,15 @@ sub make_torrent_file {
 	   @_
 	  );
 
-  die "make_torrent_file needs an infile => value parameter"
+  die "make_torrent_file: needs an infile => value parameter"
     unless defined $o{infile};
+
+  warn "make_torrent_file: stripped .torrent extension\n"
+    if $o{infile} =~ s/\.torrent$//i;
 
   die "make_torrent_file: file '$o{infile} doesn't exist\n"
     unless -f $o{infile};
 
-  die "make_torrent_file asked to operate on .torrent file"
-    if $o{infile} =~ /\.torrent$/i;
 
   # using substr instead of regular expression to make sure that
   # infile is in the source tree since I'm not sure how constants are
@@ -220,9 +221,9 @@ sub make_torrent_file {
     # scan the original (input) file for any stored attributes
     my $itags = read_xattrs($o{infile});
 
-    foreach (keys %$itags) {
-      print "input tag $_ => '" . $itags->{$_} . "'\n";
-    }
+    #foreach (keys %$itags) {
+    #  print "input tag $_ => '" . $itags->{$_} . "'\n";
+    #}
 
     # copy the md5 hash if it's not out of date (ie, file isn't newer)
     if (exists $itags->{"md5.hash"}) {
@@ -231,7 +232,6 @@ sub make_torrent_file {
 	  $otags{md5sum} = $itags->{"md5.hash"};
 	} else {
 	  warn "make_torrent_file: $o{infile}: stale md5 hash\n";
-	  warn "mtime of file $mtime > md5 timestamp ".$itags->{"md5.ts"}."\n";
 	}
       } else {
 	warn "make_torrent_file: $o{infile}: missing md5 timestamp\n";
@@ -296,7 +296,11 @@ sub publish_torrent {
   copy($source,$target) or
     die "publish_torrent: copy $source, $target failed: $!\n";
 
-
+  # copy all our extended attributes to the target file
+  if ($xattr_support) {
+    my $hashref = read_xattrs($source);
+    write_xattrs($target,%$hashref);
+  }
 }
 
 # The best torrent downloader I've used seems to be Transmission. The
@@ -392,7 +396,8 @@ sub check_file {
 
   # warn once about not being able to cache results
   unless ($xattr_support_warning ++) {
-    warn "No xattr support; check_file can't cache results\n";
+    warn "No xattr support; check_file can't cache results\n"
+      unless $xattr_support_warning
   }
 
   my $check_method = undef;
@@ -511,17 +516,21 @@ $prog mirror (file|dir)
 
   Download (updated) file contents from ODROID site
 
-$prog check (file|dir)
+$prog check (file[.torrent]|dir)
 
   Check integrity of files in local mirror
 
-$prog make (file|dir)
+$prog make (file[.torrent]|dir)
 
   Create .torrent files
 
-$prog publish (file.torrent|dir)
+$prog publish (file[.torrent]|dir)
 
   Copy torrents into www directory
+
+$prog chain (file[.torrent]|dir)
+
+  Chains check, make and publish operations into one step
 
 $prog start (file.torrent|dir)
 
@@ -560,9 +569,17 @@ if ($command eq "make") {
 
   publish_torrent(file => shift @ARGV);
 
+} elsif ($command eq "chain") {
+
+  my $file = shift @ARGV;
+  check_file($file);
+  make_torrent_file(infile => abs_path($file));
+  publish_torrent(file => $file);
+
 } elsif ($command eq "start") {
 
   start_torrent(shift @ARGV);
+
 
 } elsif ($command eq "list") {
 
