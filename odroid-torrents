@@ -188,7 +188,9 @@ sub convert_filename {
   my ($srcfile, $srctorrent, $wwwtorrent, $root, $relative) = ();
   my $absfile = abs_path($file);
 
-  # which dir is the input file in?
+  # which dir is the input file in? This is using substr instead of
+  # regular expressions since I'm not sure how constants are supposed
+  # to with with regexp. Substr should be more efficient anyhow.
   foreach my $dir (SRCROOT, WEBROOT) {
     if ($dir eq substr $absfile, $[, $[ + length $dir) {
       $root     = $dir;
@@ -226,7 +228,7 @@ sub make_torrent_file {
 
   my %o = (
 	   infile => undef,	# required
-	   comment => "default",
+	   comment => "default",# or set to undef -> no comment
 	   outfile => undef,
 	   @_
 	  );
@@ -234,30 +236,12 @@ sub make_torrent_file {
   die "make_torrent_file: needs an infile => value parameter"
     unless defined $o{infile};
 
-  if (0) {			# old code
-    warn "make_torrent_file: stripped .torrent extension\n"
-      if $o{infile} =~ s/\.torrent$//i;
+  my $outfile;
+  ($o{infile}, $outfile) = (convert_filename($o{infile}))[0,1];
+  $o{outfile} = $outfile unless defined $o{outfile};
 
-    die "make_torrent_file: file '$o{infile} doesn't exist\n"
-      unless -f $o{infile};
-
-
-    # using substr instead of regular expression to make sure that
-    # infile is in the source tree since I'm not sure how constants are
-    # supposed to with with regexp. Substr should be more efficient
-    # anyhow.
-    unless(SRCROOT eq substr $o{infile}, $[, $[ + length SRCROOT) {
-      die "make_torrent_file was given a file " . $o{infile} .
-	" outside source tree";
-    }
-
-  } else {			# new code using convert_filename
-
-    ($o{infile}, $o{outfile}) = (convert_filename($o{infile}))[0,1];
-
-    die "make_torrent_file: file '$o{infile} doesn't exist\n"
-      unless -f $o{infile};
-  }
+  die "make_torrent_file: file '$o{infile} doesn't exist\n"
+    unless -f $o{infile};
 
   # build up command based on default invocation plus input options
   my $primary_tracker = $trackers[0];
@@ -266,15 +250,11 @@ sub make_torrent_file {
   my @cmd = (BTMAKEMETAFILE, $primary_tracker, $o{infile},
 	    "--announce_list", $alt_trackers);
 
-  #$o{outfile} = $o{infile} . ".torrent" unless defined $o{outfile};
-
   if (defined $o{comment}) {
-
     if ($o{comment} eq "default") {
       my $source_url = ODROIDROOTURL . substr $o{infile},$[ + length SRCROOT;
       $o{comment} = "Downloaded from $source_url";
     }
-
     push @cmd, "--comment", $o{comment};
   }
 
@@ -379,28 +359,8 @@ sub publish_torrent {
   die "publish_torrent needs a file => var option" unless defined $o{file};
 
   my ($source, $target);
-  if (0) {
-
-    unless ($o{file} =~ /\.torrent$/) {
-      warn "publish_torrent: using '$o{file}.torrent' instead of $o{file}\n";
-      $o{file} .= ".torrent";
-    }
-
-    $source = abs_path($o{file});
-
-    unless(SRCROOT eq substr $source, $[, $[ + length SRCROOT) {
-      die "publish_torrent: $o{file}: not in the source tree";
-    }
-
-    $target = $source;
-    substr ($target, $[, $[ + length SRCROOT) = WEBROOT;
-
-  } else {
-
-    ($source, $target) = (convert_filename($o{file}))[1,2];
-    die "publish_torrent: source $source doesn't exist\n" unless -f $source;
-
-  }
+  ($source, $target) = (convert_filename($o{file}))[1,2];
+  die "publish_torrent: source $source doesn't exist\n" unless -f $source;
 
   if ($o{mode} eq "target") {
     return $target;
@@ -412,13 +372,6 @@ sub publish_torrent {
     }
   } elsif ($o{mode} ne "force") {
     die "publish_torrent: unknown mode $o{mode}";
-  }
-
-  if (0) {
-    # make target directory if it doesn't exist
-    my $target_dir = $target;
-    $target_dir =~ s|(.*)/.*|$1|;
-    make_path ($target_dir, { mode => 0775 }) unless -d $target_dir;
   }
 
   copy($source,$target) or
@@ -721,9 +674,6 @@ EOT
 umask 0002;
 
 
-
-
-
 my $command = shift @ARGV;
 
 die $usage unless defined $command;
@@ -740,7 +690,7 @@ if ($command eq "make") {
 
   my $file = shift @ARGV;
   check_file($file);
-  make_torrent_file(infile => abs_path($file));
+  make_torrent_file(infile => $file);
   publish_torrent(file => $file);
 
 } elsif ($command eq "start") {
