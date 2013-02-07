@@ -40,6 +40,13 @@ use constant TRANSMISSION   => '/usr/bin/transmission-remote';
 use constant XMISSIONPASSFILE => '/home/torrent/.transmission-netrc';
 use constant XMISSIONDEFPASS  => 'transmission:transmission';
 
+# set up base transmission command using netrc or default password
+my @base_xmission_command = (TRANSMISSION,
+			     (-f XMISSIONPASSFILE) ?
+			     ("--netrc", XMISSIONPASSFILE):
+			     ("--auth", XMISSIONDEFPASS)
+			    );
+
 # Required modules
 use Cwd qw(abs_path);
 use File::Path qw(make_path);
@@ -443,25 +450,14 @@ sub start_torrent {
       or die "failed to make_path $download_dir\n";
   }
 
-  my @command = (TRANSMISSION, "--download-dir", $download_dir);
-
-  # do we have a password file or will we use default user/pass?
-  if (-f XMISSIONPASSFILE) {
-    push @command, "--netrc", XMISSIONPASSFILE;
-  } else {
-    push @command, "--auth", XMISSIONDEFPASS;
-  }
+  my @command = (@base_xmission_command, "--download-dir", $download_dir);
 
   # it seems that we have to set the download path separately from
-  # doing the add ...
+  # doing the add ... in older versions of transmission-remote anyway.
   system @command;
 
-  # prune the command to get rid of the duplicate --download-dir
-  @command = @command[$[,$[+3 .. $#command];
-  # another way of doing the above:
-  #shift @command; shift @command; unshift @command, TRANSMISSION;
-
-  push @command, "--add", $absfile;
+  # don't include --download-dir option when adding
+  @command = (@base_xmission_command, "--add", $absfile);
 
   warn "Executing: " . (join " ", @command) . "\n";
   system @command;
@@ -477,15 +473,28 @@ sub start_torrent {
 # use that instead.
 sub stop_torrent {
   unless ($xattr_support) {
-    warn "stop_torrent requires xattr support, but we don't have it\n";
+    # we have to die here to stop caller from doing something like
+    # truncating the file after it thinks the torrenting has been
+    # safely stopped.
+    die "stop_torrent requires xattr support, but we don't have it\n";
     return;
   }
 
-  my $file = shift;
+  my $file = (convert_filename(shift))[2];
 
+  die "Can't find torrent file $file\n" unless -f $file;
 
   my $hashref = read_xattrs($file);
-  
+  my $info_hash;
+  if (exists $hashref->{"torrent.info_hash"}) {
+    $info_hash = $hashref->{"torrent.info_hash"};
+  } else {
+    die "Torrent $file doesn't have hash info; can't stop\n";
+  }
+
+  my @command = (@base_xmission_command, "--torrent", $info_hash,
+		 "--remove");
+  system @command;
 }
 
 # Returns a list of all the files we're currently downloading or
@@ -697,10 +706,13 @@ if ($command eq "make") {
 
   start_torrent(shift @ARGV);
 
+} elsif ($command eq "stop") {
+
+  stop_torrent(shift @ARGV);
 
 } elsif ($command eq "list") {
 
-  my @command = (TRANSMISSION, "--netrc", XMISSIONPASSFILE, "-l");
+  my @command = (@base_xmission_command, "-l");
 
   exec @command;
 
@@ -715,7 +727,7 @@ if ($command eq "make") {
 
     # next if /^udp:/i;
 
-    my $cmd = TRANSMISSION. " --netrc ". XMISSIONPASSFILE.
+    my $cmd = (join " ", @base_xmission_command) .
       " -t all --tracker-add $_";
 
     `$cmd `;			# `$cmd 2>/dev/null`;
