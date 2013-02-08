@@ -414,10 +414,9 @@ sub is_blocked {
 
 
 
-# publish_torrent has several different modes:
+# publish_torrent has two different modes:
 # force   ->  copy the torrent into the www directory unconditionally
 # update  ->  copy torrent if it is newer than file in www dir
-# target  ->  report the target filename in www, but do nothing
 sub publish_torrent {
 
   my %o = (
@@ -437,9 +436,7 @@ sub publish_torrent {
     return;
   }
 
-  if ($o{mode} eq "target") {
-    return $target;
-  } elsif ($o{mode} eq "update") {
+  if ($o{mode} eq "update") {
     if (-f $target) {
       my $source_mtime = (stat $source)[9];
       my $target_mtime = (stat $target)[9];
@@ -466,10 +463,6 @@ sub publish_torrent {
 # downloads. Also, it has a very fully-featured server/client mode of
 # operation that makes it easy to program.
 
-# We only torrent files that are in the www directory, but we allow
-# some latitude in specifying them. In particular, if we're in our
-# local storage directory and we specify a file or a torrent file then
-# we convert that into the correct .torrent file in the www dir.
 sub start_torrent {
 
   my $file = shift;
@@ -482,20 +475,12 @@ sub start_torrent {
     return;
   }
   if (is_blocked($absfile)) {
-    warn "start_torrent_file:: skipping blocked file $absfile\n";
+    warn "start_torrent_file: skipping blocked file $absfile\n";
     return;
   }
 
   $download_dir = $srctorrent;
   $download_dir =~ s|(.*)/.*|$1|;
-
-  # If we don't have the file locally, we may need to make a download
-  # dir for it.
-  unless (-d $download_dir) {
-    warn "start_torrent: creating download dir $download_dir\n";
-    make_path($download_dir, { mode => 0775 })
-      or die "failed to make_path $download_dir\n";
-  }
 
   my @command = (@base_xmission_command, "--download-dir", $download_dir);
 
@@ -506,7 +491,7 @@ sub start_torrent {
   # don't include --download-dir option when adding
   @command = (@base_xmission_command, "--add", $absfile);
 
-  warn "Executing: " . (join " ", @command) . "\n";
+  #warn "Executing: " . (join " ", @command) . "\n";
   system @command;
 
 }
@@ -514,28 +499,26 @@ sub start_torrent {
 # Due to the way transmission-remote works, we can't just give it a
 # torrent name and ask it to stop it. Instead, we have to look it up
 # by its torrent ID (see the list command here) or giving it the
-# torrent's info_hash. Since I'm using extended attributes to store
-# the info_hash, stop_torrent won't work without it. If that's the
-# case, simply look up transmission-remote's -l, -t and -r options and
-# use that instead.
+# torrent's info_hash. Here I try to use the stored info_hash first
+# and if that fails, it re-extracts it from the torrent file.
 sub stop_torrent {
-  unless ($xattr_support) {
-    # we have to die here to stop caller from doing something like
-    # truncating the file after it thinks the torrenting has been
-    # safely stopped.
-    die "stop_torrent requires xattr support, but we don't have it\n";
-    return;
-  }
 
   my $file = (convert_filename(shift))[2];
 
-  die "Can't find torrent file $file\n" unless -f $file;
+  die "No torrent file $file\n" unless -f $file;
 
-  my $hashref = read_xattrs($file);
-  my $info_hash;
-  if (exists $hashref->{"torrent.info_hash"}) {
-    $info_hash = $hashref->{"torrent.info_hash"};
+  my $info_hash = undef;
+  if ($xattr_support) {
+    my $hashref = read_xattrs($file);
+
+    if (exists $hashref->{"torrent.info_hash"}) {
+      $info_hash = $hashref->{"torrent.info_hash"};
+    }
   } else {
+    $info_hash = extract_info_hash($file);
+  }
+
+  unless (defined($info_hash)) {
     die "Torrent $file doesn't have hash info; can't stop\n";
   }
 
