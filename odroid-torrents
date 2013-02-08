@@ -14,7 +14,8 @@ use constant WGETPIDFILE => "/home/torrent/.odroid_wget_pid";
 
 use constant ODROIDROOTURL => "http://dn.odroid.com";
 
-use constant XATTRTAG => "otorrent.";
+use constant XATTRTAG    => "otorrent.";
+use constant XATTRBLOCK  => XATTRTAG . "sourceinfo.blocked";
 
 my @trackers = (
   "udp://tracker.publicbt.com:80/announce",
@@ -225,8 +226,35 @@ sub convert_filename {
 	  WEBROOT . "$rel_dir$rel_base.torrent");
 }
 
+#
+# Use btshowmetainfo to extract the info_hash from a .torrent file
+#
+sub extract_info_hash {
 
+  # not callable by user, so we skip error checking
+  my $file = shift;
 
+  # using a forking recipe is needed to safeguard against possible
+  # shell escapes with basic open(HANDLE, "prog args |") form.
+  my ($pid,$info_hash)=();
+  die "Can't fork: $!"
+    unless defined($pid = open CHILD, "-|");
+  if ($pid) {			# parent process
+    while (<CHILD>) {
+      #print "parsing: $_\n";
+      if (/^info hash.*:\s(\S+)/) {
+	$info_hash = $1;
+	last;
+      }
+    }
+    close CHILD or warn "child exited $?";
+  } else {			# child process
+    #warn "child about to exec " . BTSHOWMETAFILE. " $file\n";
+    die "Can't exec " . BTSHOWMETAFILE . "\n" unless
+      exec BTSHOWMETAFILE, $file;
+  }
+  return $info_hash;
+}
 
 # By default make_torrent_file will create the output torrent file in
 # the same directory as the input file and apply a "Downloaded from
@@ -249,6 +277,11 @@ sub make_torrent_file {
 
   die "make_torrent_file: file '$o{infile} doesn't exist\n"
     unless -f $o{infile};
+
+  if (is_blocked($o{infile})) {
+    warn "make_torrent_file:: skipping blocked file $o{infile}\n";
+    return;
+  }
 
   # build up command based on default invocation plus input options
   my $primary_tracker = $trackers[0];
@@ -311,29 +344,10 @@ sub make_torrent_file {
 
     # saving the info hash of the torrent will be very useful later
     # when it comes to pausing or unseeding a torrent since
-    # transmission-remote uses them to identify particular torrents.
+    # transmission-remote uses them to refer to torrents.
 
-    # using a forking recipe is needed to safeguard against possible
-    # shell escapes with basic open(HANDLE, "prog args |") form.
-    my ($pid,$info_hash)=();
-    die "Can't fork: $!"
-      unless defined($pid = open CHILD, "-|");
-    if ($pid) {			# parent process
-      while (<CHILD>) {
-	#print "parsing: $_\n";
-	if (/^info hash.*:\s(\S+)/) {
-	  $info_hash = $1;
-	  last;
-	}
-      }
-      close CHILD or warn "child exited $?";
-    } else {			# child process
-      #warn "child about to exec " . BTSHOWMETAFILE. " $o{outfile}\n";
-      die "Can't exec " . BTSHOWMETAFILE . "\n" unless
-	exec BTSHOWMETAFILE, $o{outfile};
-    }
-
-    if (defined($info_hash)) {
+    my $info_hash;
+    if (defined($info_hash = extract_info_hash($o{outfile}))) {
       #warn "got info_hash: $info_hash\n";
       $otags{"torrent.info_hash"} = $info_hash;
 
@@ -350,6 +364,55 @@ sub make_torrent_file {
     write_xattrs($o{outfile}, %otags);
   }
 }
+
+# blocking a (source) file makes it impossible to make a torrent from
+# it, mirror it or download/seed it using bittorrent. Here we have
+# three routines for blocking, unblocking and checking whether a file
+# is blocked. These work fine without xattr support, but are better
+# with it enabled since the user is less likely to inadvertantly
+# change or delete the extended attribute than they are to make it
+# writable again.
+sub block_file {
+
+  my $file = shift;
+
+  # value of the tag doesn't matter, but it stops File::ExtAttr carping
+  setfattr($file, XATTRBLOCK,1) if $xattr_support;
+
+  my $mode = (stat $file)[2];
+  chmod (($mode & 0555), $file) or die "chmod failed: $!\n";
+}
+
+sub unblock_file {
+
+  my $file = shift;
+
+  # do the equivalent of chmod ug+w, ie group members can also write
+  my $mode = (stat $file)[2];
+  chmod (($mode | 0220), $file) or die "chmod failed: $!\n";
+
+  delfattr($file, XATTRBLOCK) if $xattr_support;
+}
+
+sub is_blocked {
+
+  my $file = shift;
+  my $blocked = 0;
+
+  if ($xattr_support and defined(getfattr($file, XATTRBLOCK))) {
+    ++$blocked;
+  }
+
+  if (-w $file) {
+    warn "$file has blocked xattr set, but it is writable!\n" if $blocked;
+  } else {
+    ++$blocked;
+  }
+
+  return $blocked;
+}
+
+
 
 # publish_torrent has several different modes:
 # force   ->  copy the torrent into the www directory unconditionally
@@ -368,6 +431,11 @@ sub publish_torrent {
   my ($source, $target);
   ($source, $target) = (convert_filename($o{file}))[1,2];
   die "publish_torrent: source $source doesn't exist\n" unless -f $source;
+
+  if (is_blocked($source)) {
+    warn "publish_torrent: skipping blocked file $source\n";
+    return;
+  }
 
   if ($o{mode} eq "target") {
     return $target;
@@ -407,39 +475,18 @@ sub start_torrent {
   my $file = shift;
 
   my ($absfile, $srctorrent, $download_dir) = ($file);
-  if (0) {
-    $file .= ".torrent" unless $file =~ /.torrent$/i;
 
-    $absfile = abs_path($file);
-
-    if (SRCROOT eq substr $absfile, $[, $[ + length SRCROOT) {
-      substr ($absfile, $[, $[ + length SRCROOT) = WEBROOT;
-    } elsif (WEBROOT ne substr $absfile, $[, $[ + length WEBROOT) {
-      die "start_torrent: $file must be within source or web dirs\n";
-    }
-
-    unless (-f $absfile) {
-      if (-f $file) {
-	warn "start_torrent: did not find $absfile " .
-	  "(did you forget to publish?)\n";
-      } else {
-	warn "start_torrent: did not find $absfile " .
-	  "(or source file either)\n";
-      }
-      return;
-    }
-    $download_dir = $absfile;
-    substr ($download_dir, $[, $[ + length WEBROOT) = SRCROOT;
-
-  } else {
-    ($srctorrent,$absfile)=(convert_filename($file))[1,2];
-    unless (-f $absfile) {
-      warn "start_torrent: did not find $absfile\n";
-      return;
-    }
-    $download_dir = $srctorrent;
+  ($srctorrent,$absfile)=(convert_filename($file))[1,2];
+  unless (-f $absfile) {
+    warn "start_torrent: did not find $absfile\n";
+    return;
+  }
+  if (is_blocked($absfile)) {
+    warn "start_torrent_file:: skipping blocked file $absfile\n";
+    return;
   }
 
+  $download_dir = $srctorrent;
   $download_dir =~ s|(.*)/.*|$1|;
 
   # If we don't have the file locally, we may need to make a download
@@ -657,13 +704,41 @@ $prog start (file.torrent|dir)
 
 $prog (pause|unpause) (file.torrent|dir)
 
-  Pause or unpause particular torrent files (won't work.. use the
-  transmission-remote command directly)
+  Pause or unpause particular torrent files (needs xattr support)
 
 $prog stop (file.torrent|dir)
 
-  Stop torrenting files (won't work.. use the transmission-remote
-  command directly)
+  Stop torrenting files. Needs xattr support to look up the torrent's
+  info hash. Otherwise, use the transmission-remote command directly.
+
+$prog truncate (file)
+
+  THIS DELETES THE FILE! USE WITH CAUTION! Truncate stops torrenting
+  the file, truncates it to zero bytes, and blocks it (see below).
+
+  The intended use is to spread the mirror over several hosts, each of
+  which will act as seeders for some part of the overall mirror. By
+  truncating the file rather than deleting it, we can still store
+  metadata about the original file in its extended attributes.
+  Meanwhile, it's assumed that you've already got a copy of the file
+  stored on another host (or you don't want any copies of it at all).
+
+$prog block (file)
+
+  This makes a source file unwriteable and adds a mark that says it
+  shouldn't be used to create a new torrent file, mirrored, or
+  downloaded or shared via bittorrent.
+
+$prog unblock (file)
+
+  The opposite of the block command. If you had truncated the file,
+  you need to use start or mirror to redownload the file, or get it by
+  some other means (eg, a backup copy).
+
+$prog retag (file)
+
+  Attempts to regenerate all the extended attributes attached to the
+  source file and the associated torrent files. 
 
 $prog list
 
@@ -709,6 +784,21 @@ if ($command eq "make") {
 } elsif ($command eq "stop") {
 
   stop_torrent(shift @ARGV);
+
+} elsif ($command eq "block") {
+
+  my $file = (convert_filename(shift @ARGV))[0];
+  block_file($file);
+
+} elsif ($command eq "unblock") {
+
+  my $file = (convert_filename(shift @ARGV))[0];
+  unblock_file($file);
+
+} elsif ($command eq "blocked") {
+
+  my $file = (convert_filename(shift @ARGV))[0];
+  print "Blocked status: " . is_blocked($file) . "\n";
 
 } elsif ($command eq "list") {
 
