@@ -279,7 +279,7 @@ sub make_torrent_file {
     unless -f $o{infile};
 
   if (is_blocked($o{infile})) {
-    warn "make_torrent_file:: skipping blocked file $o{infile}\n";
+    warn "make_torrent_file: skipping blocked file $o{infile}\n";
     return;
   }
 
@@ -427,11 +427,10 @@ sub publish_torrent {
 
   die "publish_torrent needs a file => var option" unless defined $o{file};
 
-  my ($source, $target);
-  ($source, $target) = (convert_filename($o{file}))[1,2];
+  my ($original,$source,$target) = convert_filename($o{file});
   die "publish_torrent: source $source doesn't exist\n" unless -f $source;
 
-  if (is_blocked($source)) {
+  if (is_blocked($original)) {
     warn "publish_torrent: skipping blocked file $source\n";
     return;
   }
@@ -467,15 +466,15 @@ sub start_torrent {
 
   my $file = shift;
 
-  my ($absfile, $srctorrent, $download_dir) = ($file);
+  my ($absfile, $original, $srctorrent, $download_dir) = ($file);
 
-  ($srctorrent,$absfile)=(convert_filename($file))[1,2];
+  ($original,$srctorrent,$absfile)=convert_filename($file);
   unless (-f $absfile) {
     warn "start_torrent: did not find $absfile\n";
     return;
   }
-  if (is_blocked($absfile)) {
-    warn "start_torrent_file: skipping blocked file $absfile\n";
+  if (-f $original and is_blocked($original)) {
+    warn "start_torrent_file: skipping blocked file $original\n";
     return;
   }
 
@@ -598,20 +597,6 @@ sub check_file {
 #   sizes and mtimes against the originals.
 #
 
-
-
-# yes, it's probably bad style to use the ARGV global from within a
-# sub like this...
-sub do_test {
-
-  my $what = shift or die "Test what?";
-
-  if ($what eq "make") {
-    my $testfile = shift @ARGV or die "Gotta gimme somethin'";
-    make_torrent_file(infile=>abs_path($testfile));
-
-  }
-}
 
 #
 # Download management
