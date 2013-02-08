@@ -412,6 +412,36 @@ sub is_blocked {
   return $blocked;
 }
 
+# truncate stops torrenting a file, deletes its contents and blocks it
+sub truncate_file {
+
+  my $file = shift;
+
+  my ($source,$storrent,$wtorrent) = convert_filename($file);
+
+  if (-f $wtorrent) {
+    stop_torrent($file);
+  }
+
+  # if the file doesn't exist, but we have a corresponding torrent
+  # file, then create an empty file and block it (handy if we've
+  # downloaded a load of torrent files from another site and want to
+  # recreate a blank copy of each file and possibly selectively
+  # unblock them later)
+  unless (-f $source) {
+    if (-f $storrent or -f $wtorrent) {
+      open (FH,">",$source) or die "truncate_file: couldn't create file $!\n";
+      close FH;
+    }
+  }
+
+  # the truncate may fail if the file is already blocked, but there's
+  # no point in making it writable first if we've only got to block it
+  # again immediately after. We'll just warn instead of dying.
+  warn "truncate failed: $!" unless truncate $source, 0;
+
+  block_file($source);
+}
 
 
 # publish_torrent has two different modes:
@@ -487,8 +517,10 @@ sub start_torrent {
   # doing the add ... in older versions of transmission-remote anyway.
   system @command;
 
-  # don't include --download-dir option when adding
-  @command = (@base_xmission_command, "--add", $absfile);
+  # it can't hurt include --download-dir option when adding too
+  @command = (@base_xmission_command,
+	      "--download-dir", $download_dir,
+	      "--add", $absfile);
 
   #warn "Executing: " . (join " ", @command) . "\n";
   system @command;
@@ -507,19 +539,22 @@ sub stop_torrent {
   die "No torrent file $file\n" unless -f $file;
 
   my $info_hash = undef;
+
+  # method #1: xattr-based
   if ($xattr_support) {
     my $hashref = read_xattrs($file);
 
     if (exists $hashref->{"torrent.info_hash"}) {
       $info_hash = $hashref->{"torrent.info_hash"};
     }
-  } else {
-    $info_hash = extract_info_hash($file);
   }
 
-  unless (defined($info_hash)) {
-    die "Torrent $file doesn't have hash info; can't stop\n";
-  }
+  # method #2: read the torrent file
+  $info_hash = extract_info_hash($file) unless defined($info_hash);
+
+  # Still no hash info? Nothing we can do except die ...
+  die "Torrent $file doesn't have hash info; can't stop\n"
+      unless defined($info_hash);
 
   my @command = (@base_xmission_command, "--torrent", $info_hash,
 		 "--remove");
@@ -555,6 +590,134 @@ sub check_file {
   
 
 }
+
+# later on, I'd prefer to have a dynamic cgi script to display the
+# contents of each directory, but for now I'll make do with creating a
+# static HTML page in each directory with links to the dirs and files
+# contained within. This obviously needs to be updated when new
+# torrent files or subdirectories are placed in a the directory, so
+# it's not as good as a dynamically-generated page.
+sub reindex {
+
+
+
+}
+
+# 
+sub md5_digest {
+
+
+}
+
+# Since I'm spreading my seeding across several hosts, I need a way of
+# transporting extended attributes between hosts. My workflow so far
+# has been to do all the initial mirroring and torrent creation on one
+# machine, then to copy just the www directory to the other hosts
+# (using rsync, which doesn't support transferring extended
+# attributes) and from there starting those torrents and leaving them
+# run so that they will continue to be seeded. After that, I truncate
+# the original files. However, this means that the source files that I
+# download and seed from the initial host (and the torrent files I
+# rsync'd from there) won't have any of the extended attributes such
+# as file hashes, original mtime, etc. The next suite of routines are
+# intended to address that.
+
+
+# Unlike all the other routines so far which either call
+# convert_filename or take one of the outputs from that, dump_tags
+# lets you specify any filename or directory name as an input. It will
+# warning if the file/dir isn't in the source or www directory, but it
+# will still continue. If a dir is specified, it automatically
+# recurses into it.
+
+sub dump_file_tags {
+
+  my ($file) = shift;
+  my $tags = read_xattrs($file);
+
+  if (%$tags) {
+    print "$file:\n";
+    foreach my $tag (sort keys %$tags) {
+      print "  " . XATTRTAG . "$tag $tags->{$tag}\n";
+    }
+    print "\n";
+  }
+}
+
+# recursive directory scan
+sub dump_dir_tags {
+
+  my $dir = shift;
+
+  unless (opendir DIR, $dir) {
+    warn "dump_tags: Failed to open dir $dir: $!\n";
+    return;
+  }
+
+  # do a breadth-first scan of this dir
+  my @subdirs = ();
+  while (readdir DIR) {
+    next if /^\.\.?$/;
+
+    my $this = "$dir/$_";
+
+    next if -l $this;
+    if (-d $this) {
+      push @subdirs, $this;
+    } elsif  (-f $this) {
+      dump_file_tags($this)
+    } else {
+      warn "dump_tags: skipping special file $this\n";
+    }
+  }
+  closedir DIR;
+
+  # while/shift is slightly more memory-efficient than foreach
+  while (my $subdir = shift @subdirs) {
+    dump_dir_tags($subdir);
+  }
+
+}
+
+# main entry point, which does some error checking and calls one of
+# the two routines above.
+sub dump_tags {
+  my %o = (
+	   file => undef,
+	   absolute => 0,	# reports absolute filenames if set,
+                                # defaults to relative
+	   @_
+	  );
+
+  die "dump_tags: needs file => var argument\n" unless defined($o{file});
+
+  # we need to convert to absolute filename to check if it's in the
+  # source or www dir, regardless of whether we're printing relative
+  # paths in our output
+  my $absfile = abs_path($o{file});
+
+  unless ((WEBROOT eq substr $absfile, $[, $[ + length WEBROOT) or
+	  (SRCROOT eq substr $absfile, $[, $[ + length SRCROOT)) {
+    warn "dump_tags: $o{file} isn't in source or www root\n";
+  }
+
+  $o{file} = $absfile if $o{absolute};
+
+  if (-f $o{file}) {
+    dump_file_tags($o{file});
+  } elsif (-d $o{file}) {
+    $o{file} =~ s|/$||;		# prettify dir name to stop double /
+    dump_dir_tags($o{file});
+  } else {
+    die "dump_tags: no such file or directory $o{file}\n";
+  }
+}
+
+# 
+sub apply_tags {
+
+}
+
 
 # Since I've discovered that I don't have enough space on my VPS to
 # mirror the entire odroid download site, I have to be able to
@@ -703,6 +866,11 @@ $prog unblock (file)
   you need to use start or mirror to redownload the file, or get it by
   some other means (eg, a backup copy).
 
+$prog scan (file|file.torrent)
+
+  Given a file or torrent, scan shows which other files with the same
+  name exist in the source or www directories.
+
 $prog retag (file)
 
   Attempts to regenerate all the extended attributes attached to the
@@ -768,6 +936,19 @@ if ($command eq "make") {
   my $file = (convert_filename(shift @ARGV))[0];
   print "Blocked status: " . is_blocked($file) . "\n";
 
+} elsif ($command eq "truncate") {
+
+  truncate_file(shift @ARGV);
+
+} elsif ($command eq "dumptags") {
+
+  my ($file,$absolute) = @ARGV;
+  if (defined $absolute) {
+    dump_tags(file => $file, absolute => $absolute);
+  } else {
+    dump_tags(file => $file);
+  }
+
 } elsif ($command eq "list") {
 
   my @command = (@base_xmission_command, "-l");
@@ -790,14 +971,13 @@ if ($command eq "make") {
 
     `$cmd `;			# `$cmd 2>/dev/null`;
   }
-
-} elsif ($command eq "tconvert") { # test conversion
+} elsif ($command eq "scan" or $command eq "tconvert") {
 
   my ($src,$storr,$wtorr) = convert_filename(shift);
   if (defined $src) {
-    print "source file:     $src (" . (-f $src ? "have" : "no") . " file)\n";
-    print "source torrent:  $storr (" . (-f $storr ? "have" : "no") . " file)\n";
-    print "www torrent:     $wtorr (" . (-f $wtorr ? "have" : "no") . " file)\n";
+    print "source  : " . (-f $src   ? "yes" : "no ") .  " $src\n";
+    print "storrent: " . (-f $storr ? "yes" : "no ") .  " $src\n";
+    print "wtorrent: " . (-f $wtorr ? "yes" : "no ") .  " $src\n";
   } else {
     die "convert_filename failed to return anything\n";
   }
