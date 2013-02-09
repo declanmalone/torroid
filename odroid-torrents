@@ -31,6 +31,8 @@ my @trackers = (
   "http://open.tracker.thepiratebay.org/announce",
 );
 
+use constant CACHEFILE => "/home/torrent/.otorrent-cache";
+
 # external programs follow
 use constant BTMAKEMETAFILE => '/usr/bin/btmakemetafile';
 use constant BTSHOWMETAFILE => '/usr/bin/btshowmetainfo';
@@ -48,11 +50,20 @@ my @base_xmission_command = (TRANSMISSION,
 			     ("--auth", XMISSIONDEFPASS)
 			    );
 
+# list of logins on hosts that will be serving the torrents
+my @slaves = (
+	      "torrent@declanmalone.com",
+	      "torrent@euler",
+	      "torrent@euclid",
+	      # "torrent@hamilton", # not working, for some reason
+);
+
 # Required modules
 use Cwd qw(abs_path);
 use File::Path qw(make_path);
 use File::Find;
 use File::Copy;
+use Fcntl qw(:DEFAULT :flock);
 use Digest::MD5;
 
 # The following is intended to test whether we have support for
@@ -112,6 +123,61 @@ BEGIN {
     }
   }
 }
+
+
+# I'll also check for the availability of the various modules needed
+# for doing web crawling on the odroid site. Without them, we won't be
+# able to crawl the site or mirror files from it.
+my $mirror_support;
+
+BEGIN {
+  $mirror_support = 0;
+  if ( eval { require LWP::Simple } ) {
+    LWP::Simple->import;
+
+    # add more custom tests if needed ...
+    if (1) {
+      ++$mirror_support;
+    }
+  }
+
+  # use HTML::LinkExtor instead of full-blown HTML::Parser
+  if ( eval { require HTML::LinkExtor } ) {
+    HTML::LinkExtor->import;
+
+    # add more custom tests if needed ...
+    if (1) {
+      ++$mirror_support;
+    }
+  }
+
+  # we need both modules; one is not enough
+  $mirror_support = 0 unless $mirror_support == 2;
+}
+
+# While we can do mirroring using just the web modules, if we want to
+# log on to other peer hosts to check which files they've mirrored or
+# are hosting, we need to have the GRID::Machine module too. Since I'm
+# most likely going to be running this "coverage" test on a single,
+# separate machine that's authenticated to log into all the other
+# hosts, I won't need to install this module on any other host.
+# Incidentally, I could equally have used IPC::PerlSSH instead of
+# GRID::Machine, but I chose the latter since it's newer and more
+# fully-featured.
+my $rpc_support;
+
+BEGIN {
+  $rpc_support = 0;
+  if ( eval { require GRID::Machine } ) {
+    GRID::Machine->import;
+
+    # add more custom tests if needed ...
+    if (1) {
+      ++$rpc_support;
+    }
+  }
+}
+
 
 # Helper function to grab all the otorrent.* extended attributes.
 # returns a (possibly empty) hash of values
@@ -656,7 +722,8 @@ sub dump_dir_tags {
 
   # do a breadth-first scan of this dir
   my @subdirs = ();
-  while (readdir DIR) {
+  local ($_);
+  while ($_ = readdir DIR) {	# while(readdir DIR) needs perl >= 5.11.2
     next if /^\.\.?$/;
 
     my $this = "$dir/$_";
@@ -801,7 +868,224 @@ sub apply_tags {
 #
 # various other local metadata (eg, last download time, md5 digest)
 
+#
+#--------------------------------------------------------------------
+#
+
+#
+# It's about time that I started looking into doing a bit of work
+# needed to support mirroring files. The last updates to the odroid
+# website threw a lot of data up there, and I'm struggling to keep
+# track of which files I've downloaded to which machines and which
+# files among them I've tested and made torrents of. A relatively easy
+# solution comes in two parts: one part scans (crawls) the odroid main
+# site and gathers information about all the files there (filenames,
+# sizes and modification time), while the other logs into my hosts and
+# at a minimum checks whether I have copies of those files in my www
+# directory and/or source directory and checks whether those sources
+# are incomplete, out of date or blank (the latter is most important,
+# but checking for files that aren't blank, but don't match with the
+# original is probably something I should do---at least it will let me
+# distinguish between complete downloads and partial ones).
+#
+# I'm calling these two routines spider and coverage. The spider
+# routine will definitely have to save its output to a file. To do it
+# right, it will also have to do a graceful update to that file, I may
+# also want to implement some sort of diff between the older
+# file. This would allow me to quickly see what new files have
+# appeared on the site since the last spider. I'd also like to be able
+# to regenerate that report so the workflow will be something like
+# spider   -> generate initial/new web crawl results
+# newfiles -> show which files are new(*)
+# do stuff -> test coverage, decide where to put files, start downloads,
+#             etc.
+# newfiles -> keep checking the report until all downloads are started
+# coverage -> see download/torrent creation status
+# chain    -> do publishing of completed torrents
+# coverage -> keep checking until all torrents are published
+#
+# (*) it strikes me that maybe it's best for my newfiles report to be
+# filtered through my coverage test to some degree. For a start, when
+# I generate the first spider report, I'll have a big list of new
+# files that I've already processed, so the first report won't me of
+# any use to me. As a to-do list, it would be much more useful for me
+# to work directly with the coverage list (and diffs thereof). So: a
+# rethink...
+#
+# In a slightly-modified scheme, I would roll the web spidering in
+# with checking the files on each of my machines. First, I check each
+# dir on the master site and sort the entries before any
+# processing. Then, because the entries are sorted, I can do a diff
+# between the old report and the new one as I go. If I have any old
+# report, and it tells me that I already have a mirror set up and its
+# stats tally with what's on the current file on the main server, then
+# I simply copy the entire record to the new spider file. The old
+# report then acts like a cache, letting me avoid unnecessary
+# accesses. If I have no information about the file, or if the cached
+# information doesn't match with the main server, then I will log on
+# to each of my storage hosts and check the stats of any matching file
+# there. Finally, I'd write a record including details on the master
+# file along with all the information gathered from the storage hosts.
+#
+# Even though this should be enough in most cases, I'd still want to
+# force checks on what's on each storage host instead of just relying
+# on cached data. Files on these hosts can change independently of any
+# locally cached data, so I need to be able to update the
+# cache. Although it's not a great name for it, I guess "coverage"
+# will do since it does involve logging into my hosts to see how well
+# they cover all the files on the main site. It differs from "spider"
+# in that it doesn't contact the main odroid server at all, although
+# it does have to update the master cache that the spider routine
+# generates.
+#
+# (**) Another update: after writing the code to check for the
+# availability of the web modules and GRID::Machine, it struck me that
+# we need the web modules for mirroring, too, and it's only the
+# coverage test that really needs GRID::Machine. Also, it would be
+# very beneficial to keep a local cache of information about files on
+# the odroid site even if we don't have (or can't generate) coverage
+# information for other hosts. I'm actually getting a bit confused now
+# about the best approach... maybe for mirroring we don't actually
+# need any local cache at all? Hmmm... I guess it would still be
+# useful if I want to generate a report comparing the current host's
+# files against a slighty out-of-date list of master files since it's
+# less wasteful than doing a full crawl of the odroid site each time.
+#
+# So, I've decided to keep the cache and use it for both mirroring and
+# coverage tests. That still leaves the question about whether to
+# couple crawling and (a possibly local) coverage test. I think that
+# the answer should probably be "yes". It does mean that it makes
+# doing the coverage test is more complex, but if we do all the hard
+# work in one place then it makes ancillary reports and mirroring much
+# easier to handle. Decoupling is also good because, for example, we
+# can generate the cache globally and in one place, and then write our
+# mirroring or coverage update tasks as filters that selectively
+# operate only on part of the file. They still have to update the file
+# gracefully, which is a problem when compared to using a database,
+# but at least I can factor out the code that does "in-place" updates.
+
+# For my locking routines I distinguish between read and write locks,
+# with write locks being used for long-running update tasks like
+# running a spider on the odroid site, with read locks being used to
+# ensure that shorter-running tasks that just need to slurp the file
+# in and do something with it get to see a consistent version of the
+# file, regardless of whether a writing process updates it mid-way
+# through the slurp.  I use non-blocking locks so that I can give
+# feedback and also make several attempts to get the lock before
+# giving up. Also note that we don't attempt to lock the file itself,
+# but lock file.READ or file.WRITE since the file itself may not exist
+# when we want to lock it (ie, file.READ and file.WRITE are what are
+# known as "sentinels").
+
+sub getlock {
+  my ($file, $type, $verbose, $backoff, $tries) = @_;
+
+  die "getlock: need a filename argument\n" unless defined $file;
+
+  # provide some default values
+  if ($type eq "READ") {
+    $backoff = 2 unless defined $backoff; # read locks are short-lived
+    $tries   = 3 unless defined $tries;   # pretty arbitrary
+  } elsif ($type eq "WRITE") {
+    $backoff = 10 unless defined $backoff; # write locks last longer
+    $tries   = 0 unless defined $tries;	   # "infinite" wait
+  } else {
+    die "getlock: type argument must be READ or WRITE\n";
+  }
+
+  # by default, don't be too noisy
+  $verbose = 0 unless defined $verbose;
+
+  my ($lockname,$fh) = ("$file.$type");
+  open $fh, "+< $lockname" or die "getlock: open $lockname failed: $!\n";
+
+  my $attempts = 1;
+  do {
+
+    if (flock($fh, LOCK_EX|LOCK_NB)) {
+
+      # Store our PID in the lock file so that we can produce useful
+      # warning/error messages later
+      truncate $fh, 0;		# there should be no need to seek
+      local ($|) = 1;
+      print $fh "$$\n";
+
+      warn "getlock: got lock $lockname on try number $attempts\n"
+	if $verbose
+
+      # It's up to the calling routine to close the filehandle (and
+      # hence the lock) when they're finished with it. As a result we
+      # don't have a subroutine for releasing the lock.
+      return $fh;
+    }
+
+    # No success this time, so [warn and] sleep for a while
+    --$tries;
+    warn "getlock: failed to lock $lockname (try # $attempts, $tries left)\n"
+      if $verbose;
+
+    ++$attempts;
+    sleep $backoff;
+
+  } while($tries);
+
+  # Fail somewhat gracefully
+  if ($verbose) {
+    my $pid = <$fh>;
+    chomp $pid;
+    warn "getlock: giving up locking $lockname (locked by PID $pid)\n";
+  }
+  close ($fh);			# don't rely on perl's garbage collection
+
+  return undef;
+}
+
+
+# master routine 
+sub update_crawler_cache {
+  my %o = (
+	   docrawl => 0,
+	   @_,
+	  );
+
+
+}
+
+# wrapper routine that crawls main website
+sub spider {
+
+
+}
+
+sub mirror_file {}
+sub mirror_dir {}
+
+# mirror does not require any updates to our cache so we don't need to
+# go get a write lock on it. We do need to get a read lock, though, so
+# that our input file is in a consistent state even if a writer
+# happens to replace the file while we're reading it.
+sub mirror {
+
+  my $uri = shift;		# not exactly a URI, but close enough
+
+  die "Modules required to mirror are not available!\n"
+    unless $mirror_support;
+
+  # 
+  if (ODROIDROOTURL eq substr $uri, $[, $[ + length ODROIDROOTURL) {
+  }
+}
+
+
+# wrapper routine that 
+sub coverage {
+
+
+}
+
 #warn "xattr_support? $xattr_support\n";
+
+
 
 
 my $prog = $0; $prog =~ s|.*/||;
