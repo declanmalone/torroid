@@ -52,10 +52,11 @@ my @base_xmission_command = (TRANSMISSION,
 
 # list of logins on hosts that will be serving the torrents
 my @slaves = (
-	      "torrent@declanmalone.com",
-	      "torrent@euler",
-	      "torrent@euclid",
-	      # "torrent@hamilton", # not working, for some reason
+	      'torrent@declanmalone.com',
+	      'torrent@euler',
+	      'torrent@euclid',
+	      'torrent@ks362632.kimsufi.com',
+	      'torrent@hamilton', # not working, for some reason
 );
 
 # Required modules
@@ -1011,7 +1012,7 @@ sub getlock {
       print $fh "$$\n";
 
       warn "getlock: got lock $lockname on try number $attempts\n"
-	if $verbose
+	if $verbose;
 
       # It's up to the calling routine to close the filehandle (and
       # hence the lock) when they're finished with it. As a result we
@@ -1040,6 +1041,92 @@ sub getlock {
   return undef;
 }
 
+# the following two routines are intended to provide abstract
+# implementations for reading and updating a sorted list of data items
+# stored in a file using the above lock routine to guarantee
+# consistency. It is totally generic and allows us to build any kind
+# of filter that reads or updates our cache file. To be this generic,
+# it uses a few advanced techniques such as closures, callbacks and
+# continuations. The best way to understand how this works is to look
+# at the routines that implement different filters using it.
+# Alternatively, look up the documentation for Algorithm::Diff, which
+# solves a version of the problem in a similar way.
+sub sorted_diff_filter {
+
+  my %o = (
+	   file   => undef,
+	   update => 0,
+	   @_
+	  );
+
+  # throughout this code, the "a" variables relate to the file being
+  # read/updated, while the "b" variables relate to the custom list
+  # supplied by the caller
+
+  my $ahash = {};
+  my ($lock);
+
+  if ($o{update}) {
+
+    my ($ifh,$ofh);
+    unless (defined($lock = getlock($o{file}, "WRITE", 1))) {
+      die "Failed to get write lock\n";
+    }
+    open ($ifh, "<", $o{file})
+      or die "failed to open input file: $!\n";
+    open ($ofh, ">", "$o{file}.new")
+      or die "failed to open output file: $!\n";
+    $ahash->{ifh}  = $ifh;
+    $ahash->{ofh}  = $ofh;
+    $ahash->{lock} = $lock;
+
+  } else {
+
+    # for reading the file, we use a short-lived read filter and slurp
+    # the whole file in. Slurping doesn't scale well and it makes it
+    # so that we have to implement different versions of read, eof and
+    # so on, but (a) I don't expect the file list to be that big, and
+    # (b) I want to use closures to encapsulate file methods anyway,
+    # so it's not a big deal that we have a different implementation
+    # here.
+
+    my ($fh,@contents);
+    unless (defined($lock = getlock($o{file}, "READ", 1))) {
+      die "Failed to get read lock\n";
+    }
+    if (-f $o{file}) {
+      open ($fh, "<", $o{file})
+	or die "failed to open input file: $!\n";
+      @contents = (<$fh>);
+      close $fh;
+    } else {
+      @contents = ();
+    }
+    
+
+    # 
+    $ahash->{lock} = undef;
+
+  }
+
+
+  # read from new list
+
+  do {
+
+    # read again  from new list
+  } while ("read new data");
+
+  if ("new has") {
+  }
+
+}
+
+sub diffing_update_filter {
+
+
+}
+
 
 # master routine 
 sub update_crawler_cache {
@@ -1057,14 +1144,15 @@ sub spider {
 
 }
 
-sub mirror_file {}
-sub mirror_dir {}
-
 # mirror does not require any updates to our cache so we don't need to
 # go get a write lock on it. We do need to get a read lock, though, so
 # that our input file is in a consistent state even if a writer
 # happens to replace the file while we're reading it.
-sub mirror {
+
+sub mirror_file {}
+sub mirror_dir {}
+
+sub mirror_file_or_dir {
 
   my $uri = shift;		# not exactly a URI, but close enough
 
@@ -1215,6 +1303,8 @@ if ($command eq "make") {
   my $file = (convert_filename(shift @ARGV))[0];
   unblock_file($file);
 
+
+
 } elsif ($command eq "blocked") {
 
   my $file = (convert_filename(shift @ARGV))[0];
@@ -1265,6 +1355,33 @@ if ($command eq "make") {
   } else {
     die "convert_filename failed to return anything\n";
   }
+
+
+} elsif ($command eq "selfupdate") {
+
+  # copy this script to the bin dir of each slave machine
+  for my $m (@slaves) {
+    `scp $0 $m:bin`;
+  }
+
+} elsif ($command eq "websync") {
+
+  # synchronise the torrent collection (in www dir) across each slave
+
+  # first rsync all the files into our local webroot
+  for my $m (@slaves) {
+    warn "Receiving from $m\n";
+    system ("rsync", "-avX", "$m:" . WEBROOT . "/", WEBROOT)
+      and die "rsync failed: $?\n";
+  }
+
+  # then rsync them all back out again
+  for my $m (@slaves) {
+    warn "Sending to $m\n";
+    system ("rsync", "-avX", WEBROOT . "/", "$m:" . WEBROOT)
+      and die "rsync failed: $?\n";
+  }
+
 } else {
 
   die "Unknown command: $command\n";
