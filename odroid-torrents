@@ -1174,6 +1174,164 @@ sub coverage {
 #warn "xattr_support? $xattr_support\n";
 
 
+# Rewriting the above pseudocode sections as actual code based on
+# notes found here and elsewhere (my notebook). The salient points
+# are:
+
+# * do_diff will accept various callbacks in a style similar to
+#   Algorithm::Diff
+
+# * the spider routine will be the only routine capable of creating
+#   the cache of remote web pages, but apart from examining file sizes
+#   and modification times, it won't do any downloading apart from
+#   parsing index.html files
+
+# * The mirror and coverage routines will update the cache, with other
+#   routines just reading it and reporting on its contents.
+
+# * I'll include the option to slurp in the file if it's not being
+#   used for updating.
+
+# * Even routines (such report generators) that don't do "diffs" as
+#   such or that don't update the cache will still call do_diff.
+#   They'll simply implement their functionality in "insert_a"
+#   callbacks.
+
+# * I abandoned the idea of converting either the do_diff or calling
+#   programs using explicit continutation style, since callback
+#   handlers can access shared state using the closure mechanism.
+
+# In keeping with Algorithm::Diff, I'm using A to refer to the
+# original list, with the B list (actually a reference to one) being
+# provided by the calling program.
+sub do_diff {
+
+  # need to predeclare $B so that we can implement our default consume
+  # callback below. Perl doesn't let us refer to $o{list} from within
+  # the definition of %o itself, so I use @$B instead as a workaround.
+  my (@A,$B);
+  my %o = (
+	   # A default value of file => undef below would make the
+	   # code more generic. I'm just going for convenience here.
+	   file     => CACHEFILE,
+	   update   => 0,
+	   slurp    => 1,	# read A in in one go?
+	   list     => [],	# empty B list
+
+	   # default callbacks don't do much at all
+	   init     => sub { },
+	   compare  => sub { my ($a,$b) = @_; return $a cmp $b },
+	   insert_a => sub { },
+	   insert_b => sub { },
+	   matching => sub { },
+	   consume  => sub { shift @$B },
+	   @_
+	  );
+  $B = $o{list};
+
+
+
+  # define aliases for the more commonly-used callbacks
+  my $compare    = $o{compare};
+  my $insert_a   = $o{insert_a};
+  my $insert_b   = $o{insert_b};
+  my $matching   = $o{matching};
+  my $consume_b  = $o{consume};
+
+  my ($a,$b);
+  my $cancel = undef;		# consume callback can notify us to
+                                # cancel an update
+
+  $a = shift @A;
+  ($b,$cancel) = &$consume_b();
+
+  while (defined($a) and defined($b) and !defined($cancel)) {
+    my $tilt = &$compare($a,$b);
+    if ($tilt == -1) {		# $a < $b
+      &$insert_a($a);
+      $a = shift @A;
+    } elsif ($tilt == 0) {	# $a = $b
+      &$matching($a,$b);
+      # advance in both lists
+      $a = shift @A;
+      ($b,$cancel) = &$consume_b();
+    } elsif ($tilt == +1) {	# $a > $b
+      &$insert_b($b);
+      ($b,$cancel) = &$consume_b();
+    }
+  }
+  while (defined($a) and !defined($cancel)) {
+    &$insert_a($a);
+    $a = shift @A;
+  }
+  while (defined($b) and !defined($cancel)) {
+    &$insert_b($b);
+    ($b,$cancel) = &$consume_b();
+  }
+
+
+
+}
+
+sub spider_read_dir {
+  my $url = shift;
+  # read in this directory and extract a list of contents
+  # for convention, we'll use "dir/" and "file"
+  return ("sorted list of urls")
+}
+sub spider_read_file {
+  my $url = shift;
+  # read in metadata for a file, in particular the size and
+  # modification time
+  return ("some structure");
+}
+sub spider {
+  my $baseurl = shift;
+  my @queue   = (spider_read_dir(ODROIDROOTURL . "/"));
+
+  # set up signal handler
+  my $intr = undef;
+  local ($SIG{INT}) = sub {
+    $SIG{INT} = 'IGNORE';	# we will quit in our own time anyway
+    $intr = 1;
+  };
+
+  # output file handle sent back in init callback
+  my ($fh);
+
+  do_diff(
+	  update   => 1,
+	  list     => \@queue,
+	  # we get a callback after do_diff finishes setting up files
+	  init     => sub { ($fh) = @_; },
+	  cmp      => sub {
+	    my ($a,$b) = @_;
+	    $a = s/\0.*//;    # strip extra cached data
+	    return $a cmp $b;
+	  },
+	  # preserve deleted records
+	  insert_a => sub { print $fh, $a },
+	  insert_b => sub {
+	    # this is a new dir/file
+	  },
+	  matching => sub {
+	    # update an existing record
+	  },
+	  # consume does the same as shifting one element from
+	  # the queue, but if it's a dir, we also look up the 
+	  # contents and prepend them
+	  consume  => sub {
+	    my $item = shift(@queue);
+	    if (defined($item) and !$intr) {
+	      if ($item =~ m|.*/$|) {
+		unshift @queue, spider_read_dir("$baseurl/$item");
+	      }
+	    }
+	    return ($item,$intr);
+	  },
+	 );
+}
+
 
 
 my $prog = $0; $prog =~ s|.*/||;
