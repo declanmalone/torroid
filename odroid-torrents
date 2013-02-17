@@ -647,6 +647,87 @@ sub list_torrents {
 
 }
 
+# The way the md5sum files are stored on the odroid site is a little
+# bit inconsistent. Sometimes there is a single filename.md5sum file
+# corresponding to the original filename, but at other times there's
+# one md5sum file that contains details of several files. At least all
+# the files seem to have the same format internally (just the output
+# of the md5sum program). If I want to automatically check the md5sums
+# of downloads then I have to scan the entire directory in to check
+# for .md5sum files and store the contents. I'm implementing a caching
+# scheme that saves details of all md5sum files on a per-directory
+# basis to avoid overheads of having to scan each directory multiple
+# times for each file in it. I chose to cache all results rather than
+# just the last directory since we might traverse the tree in
+# depth-first mode and this would invalidate the cache for many
+# accesses. Plus, there shouldn't be too many .md5sum files, so
+# storing all of them shouldn't ever be a problem.
+my %md5_cache = ();	# dir => file => hash
+
+sub official_md5_info {
+  my $file = shift;		# assumed to be absolute
+
+  # regular expressions with "use" constants are messy, so make a copy
+  my $src = SRCROOT;
+  my ($dirpart,$filepart);
+  if ($file =~ m|^$src/(.*)/(.*)|) {
+    ($dirpart,$filepart) = ($1,$2);
+  } else {
+    die "offical_md5_info: invalid filename\n";
+  }
+
+  unless (exists $md5_cache{$dirpart}) {
+
+    # traverse the directory looking for *.md5sum files
+
+    # Perl's standard glob and <*.c> operators are a bit lacking since
+    # they fail on filenames that have spaces in them. Rather than use
+    # File::Glob (which has bsd_glob, which gets around that problem)
+    # and introduce another dependency, I'll use the standard opendir
+    # and readdir keywords.
+    opendir (DIR, SRCROOT . "/$dirpart") || die;
+    my ($f);
+    while ($f = readdir DIR) {	# while(readdir DIR) needs perl >= 5.11.2
+
+      # prepend full path so that all file tests and open work
+      my $full = SRCROOT . "/$dirpart/$f";
+
+      next unless -f $full;
+      next unless $full =~ /\.md5sum$/i;
+
+      if (open FH, "<", $full) {
+	while (<FH>) {
+	  chomp;
+	  if (/^([0-9a-fA-f]+)\s+(.*)/) {
+	    my ($thisfile,$thishash) = ($2,$1);
+	    $md5_cache{$dirpart} = {} unless exists $md5_cache{$dirpart};
+	    $md5_cache{$dirpart}->{$thisfile} = $thishash;
+	  } else {
+	    warn "offical_md5_info: $full: invalid .md5sum file format\n";
+	    last;
+	  }
+	}
+	close(FH);
+      } else {
+	warn "offical_md5_info: failed to open $f: $!\n";
+      }
+    }
+    closedir DIR;
+  }
+
+  # now check if the file is in the cache
+  if (exists $md5_cache{$dirpart}) {
+    if (exists $md5_cache{$dirpart}->{$filepart}) {
+      return  $md5_cache{$dirpart}->{$filepart};
+    }
+  }
+
+  # For no match, return the null string instead of undef. This makes
+  # it easier for the calling program to use, since they can just
+  # write if ($hash eq offical_md5_info($f)) { ... }
+  return '';
+}
+
 
 # check_file attempts to detect errors in a file based on its file
 # extension. If there is a corresponding md5 hash file it checks
@@ -1367,7 +1448,7 @@ sub spider {
 	    return $key;
 	  },
 	  # warn about deleted records
-	  insert_a => sub { warn  shift . " disappeared from site\n"; },
+	  insert_a => sub { warn (shift) . " disappeared from site\n"; },
 	  insert_b => sub {
 	    # this is a new dir/file
 	    my $b = shift;
@@ -1617,6 +1698,13 @@ if ($command eq "make") {
 } elsif ($command eq "spider") {
 
   spider;
+
+} elsif ($command eq "omd5") {	# check official md5
+
+  my $file = (convert_filename(shift @ARGV))[0];
+
+  my $hash = official_md5_info($file);
+  print "Official MD5: '$hash'\n";
 
 } else {
 
