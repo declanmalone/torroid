@@ -998,7 +998,7 @@ sub getlock {
   $verbose = 0 unless defined $verbose;
 
   my ($lockname,$fh) = ("$file.$type");
-  open $fh, "+< $lockname" or die "getlock: open $lockname failed: $!\n";
+  open $fh, "+>> $lockname" or die "getlock: open $lockname failed: $!\n";
 
   my $attempts = 1;
   do {
@@ -1007,7 +1007,8 @@ sub getlock {
 
       # Store our PID in the lock file so that we can produce useful
       # warning/error messages later
-      truncate $fh, 0;		# there should be no need to seek
+      truncate $fh, 0;
+      seek $fh, 0, 0;
       local ($|) = 1;
       print $fh "$$\n";
 
@@ -1138,11 +1139,6 @@ sub update_crawler_cache {
 
 }
 
-# wrapper routine that crawls main website
-sub spider {
-
-
-}
 
 # mirror does not require any updates to our cache so we don't need to
 # go get a write lock on it. We do need to get a read lock, though, so
@@ -1177,26 +1173,26 @@ sub coverage {
 # Rewriting the above pseudocode sections as actual code based on
 # notes found here and elsewhere (my notebook). The salient points
 # are:
-
+#
 # * do_diff will accept various callbacks in a style similar to
 #   Algorithm::Diff
-
+#
 # * the spider routine will be the only routine capable of creating
 #   the cache of remote web pages, but apart from examining file sizes
 #   and modification times, it won't do any downloading apart from
 #   parsing index.html files
-
+#
 # * The mirror and coverage routines will update the cache, with other
 #   routines just reading it and reporting on its contents.
-
+#
 # * I'll include the option to slurp in the file if it's not being
 #   used for updating.
-
+#
 # * Even routines (such report generators) that don't do "diffs" as
-#   such or that don't update the cache will still call do_diff.
-#   They'll simply implement their functionality in "insert_a"
-#   callbacks.
-
+#   such or that don't insert any new lines into the cache will still
+#   call do_diff.  They'll simply implement their functionality in
+#   "insert_a" callbacks.
+#
 # * I abandoned the idea of converting either the do_diff or calling
 #   programs using explicit continutation style, since callback
 #   handlers can access shared state using the closure mechanism.
@@ -1226,9 +1222,8 @@ sub do_diff {
 	   matching => sub { },
 	   consume  => sub { shift @$B },
 	   @_
-	  );
+ 	  );
   $B = $o{list};
-
 
   # Do file locking, opening and slurping based on options
 
@@ -1259,13 +1254,12 @@ sub do_diff {
     unless (defined($lock = getlock($o{file}, "READ", 1))) {
       die "Failed to get read lock\n";
     }
-
   }
 
   # We need to allow for the case where there the input file doesn't
   # exist. Rather than do something like opening /dev/null instead (so
   # we have a filehandle to work with when we're not slurping) I'll
-  # silently switch to slurp mode and use an empty list.
+  # silently switch to slurp mode.
   $o{slurp} = 1 unless -f $o{file};
 
   # default consume closure for A corresponds to slurping an empty or
@@ -1278,7 +1272,7 @@ sub do_diff {
     open ($ifh, "<", $o{file})
       or die "failed to open input file: $!\n";
 
-    # different closures depending on slurp setting
+    # set up closure depending on slurp setting
     if ($o{slurp}) {
       @A = (<$ifh>);
       close $ifh;
@@ -1290,11 +1284,17 @@ sub do_diff {
 	$lock = undef;
       }
     } else {
-      $consume_a = sub { <$ifh>	};
+      # scalar stops us accidentally slurping in a list context
+      $consume_a = sub { scalar <$ifh> };
     }
   }
 
-  # define aliases for the more commonly-used callbacks
+  # Now that initialisation is complete, send our output file handle
+  # back to caller so they can print to it.
+  $o{init}->($ofh);
+
+  # define aliases for the more commonly-used callbacks (less unweildy
+  # than the syntax in the line above!)
   my $compare    = $o{compare};
   my $insert_a   = $o{insert_a};
   my $insert_b   = $o{insert_b};
@@ -1305,19 +1305,17 @@ sub do_diff {
   my $cancel = undef;		# consume callback can notify us to
                                 # cancel an update
 
-  $a = shift @A;
-  ($b,$cancel) = &$consume_b();
+  ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
 
   while (defined($a) and defined($b) and !defined($cancel)) {
     my $tilt = &$compare($a,$b);
     if ($tilt == -1) {		# $a < $b
       &$insert_a($a);
-      $a = shift @A;
+      $a = &$consume_a();
     } elsif ($tilt == 0) {	# $a = $b
       &$matching($a,$b);
       # advance in both lists
-      $a = shift @A;
-      ($b,$cancel) = &$consume_b();
+      ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
     } elsif ($tilt == +1) {	# $a > $b
       &$insert_b($b);
       ($b,$cancel) = &$consume_b();
@@ -1325,7 +1323,7 @@ sub do_diff {
   }
   while (defined($a) and !defined($cancel)) {
     &$insert_a($a);
-    $a = shift @A;
+    $a = &$consume_a();
   }
   while (defined($b) and !defined($cancel)) {
     &$insert_b($b);
@@ -1349,10 +1347,32 @@ sub do_diff {
 }
 
 sub spider_read_dir {
-  my $url = ODROIDROOTURL . shift;
+  my $rel = shift;
+  my $url = ODROIDROOTURL . $rel;
+
+  #warn "Visiting '$rel'\n";
+
+  my @links = ();
+  my $content = get($url);
+  die "Failed to download $url\n" unless defined($content);
+
+  my $h = HTML::LinkExtor->new
+    (
+     sub {
+       my($tag, %attr) = @_;
+       return unless $tag =~ /^a$/i;
+       my $href = $attr{href};
+       return unless $href =~ s|^$url||;
+       return if $href =~ m|^\?|;   # skip internal navigation links
+       return if $href =~ m|^\.\.|; # skip parent link
+       #warn " +link $rel$href\n";
+       push @links, "$rel$href";
+     }, $url);
+  $h->parse($content);
+
   # read in this directory and extract a list of contents
   # for convention, we'll use "dir/" and "file"
-  return ("sorted list of urls")
+  return (sort { $a cmp $b } @links);
 }
 sub spider_read_file {
   my $url = shift;
@@ -1368,36 +1388,63 @@ sub spider {
 
   # we save memory by omitting the base ODROID site URL, which is
   # implicitly added whenever we actually try to download something.
-  my $url = "/";
+  my $url = "";
   my @queue   = (spider_read_dir($url));
 
   # set up signal handler
   my $intr = undef;
   local ($SIG{INT}) = sub {
     $SIG{INT} = 'IGNORE';	# we will quit in our own time anyway
+    warn "Got interrupt signal. Rolling back update\n";
     $intr = 1;
   };
 
   # output file handle sent back in init callback
   my ($fh);
+  $|++;
+
+  # since callbacks for insert_b and matching both effectively do the
+  # same work, I factor that out here.
+  local *save_header_info = sub {
+
+    my $rel = shift;
+    my $url = ODROIDROOTURL . $rel;
+
+    if ($rel=~m|/$|) {
+      print $fh "$rel\n";
+    } else {
+      my ($content_type, $document_length, $modified_time,
+	  $expires, $server) = head($url);
+      die "Failed to get header info for $url\n" unless defined($content_type);
+      warn "Adding file info for $rel\n";
+      print $fh "$rel\0$modified_time\0$document_length\n";
+    }
+
+  };
 
   do_diff(
 	  update   => 1,
 	  list     => \@queue,
 	  # we get a callback after do_diff finishes setting up files
-	  init     => sub { ($fh) = @_; },
-	  cmp      => sub {
+	  init     => sub { ($fh) = @_; warn "INIT callback\n"},
+	  compare  => sub {
 	    my ($a,$b) = @_;
 	    $a = s/\0.*//;    # strip extra cached data
 	    return $a cmp $b;
 	  },
-	  # preserve deleted records
-	  insert_a => sub { print $fh, $a },
+	  # warn about deleted records
+	  insert_a => sub { warn  shift . " disappeared from site\n"; },
 	  insert_b => sub {
 	    # this is a new dir/file
+	    my $b = shift;
+	    #warn "Got insert_b item: $b\n";
+	    save_header_info($b);
 	  },
 	  matching => sub {
 	    # update an existing record
+	    my ($a,$b) = shift;
+	    warn "Got matching item: $b\n";
+	    save_header_info($b);
 	  },
 	  # consume does the same as shifting one element from the
 	  # queue, but if it's a dir, we also look up the contents and
@@ -1405,9 +1452,10 @@ sub spider {
 	  # file so long as "foo/" is less than "foo/bar"
 	  consume  => sub {
 	    my $item = shift(@queue);
-	    if (defined($item) and !$intr) {
+	    if (defined($item) and !defined($intr)) {
 	      if ($item =~ m|.*/$|) {
-		unshift @queue, spider_read_dir("$url/$item");
+		#unshift @queue, spider_read_dir("$item");
+		unshift @queue, spider_read_dir("$url$item");
 	      }
 	    }
 	    return ($item,$intr);
@@ -1622,6 +1670,10 @@ if ($command eq "make") {
     system ("rsync", "-avX", WEBROOT . "/", "$m:" . WEBROOT)
       and die "rsync failed: $?\n";
   }
+
+} elsif ($command eq "spider") {
+
+  spider;
 
 } else {
 
