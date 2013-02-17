@@ -129,16 +129,16 @@ BEGIN {
 # I'll also check for the availability of the various modules needed
 # for doing web crawling on the odroid site. Without them, we won't be
 # able to crawl the site or mirror files from it.
-my $mirror_support;
+my $spider_support;
 
 BEGIN {
-  $mirror_support = 0;
+  $spider_support = 0;
   if ( eval { require LWP::Simple } ) {
     LWP::Simple->import;
 
     # add more custom tests if needed ...
     if (1) {
-      ++$mirror_support;
+      ++$spider_support;
     }
   }
 
@@ -148,12 +148,12 @@ BEGIN {
 
     # add more custom tests if needed ...
     if (1) {
-      ++$mirror_support;
+      ++$spider_support;
     }
   }
 
   # we need both modules; one is not enough
-  $mirror_support = 0 unless $mirror_support == 2;
+  $spider_support = 0 unless $spider_support == 2;
 }
 
 # While we can do mirroring using just the web modules, if we want to
@@ -1157,7 +1157,7 @@ sub mirror_file_or_dir {
   my $uri = shift;		# not exactly a URI, but close enough
 
   die "Modules required to mirror are not available!\n"
-    unless $mirror_support;
+    unless $spider_support;
 
   # 
   if (ODROIDROOTURL eq substr $uri, $[, $[ + length ODROIDROOTURL) {
@@ -1209,7 +1209,7 @@ sub do_diff {
   # need to predeclare $B so that we can implement our default consume
   # callback below. Perl doesn't let us refer to $o{list} from within
   # the definition of %o itself, so I use @$B instead as a workaround.
-  my (@A,$B);
+  my $B;
   my %o = (
 	   # A default value of file => undef below would make the
 	   # code more generic. I'm just going for convenience here.
@@ -1230,6 +1230,69 @@ sub do_diff {
   $B = $o{list};
 
 
+  # Do file locking, opening and slurping based on options
+
+  # We use callbacks to handle "consume" operation on the original
+  # file so that we can abstract away differences between slurping the
+  # file in one go and reading it line by line.
+
+  my @A;
+  my $consume_a;
+  my $close_a;
+  my ($lock,$ifh,$ofh);
+
+  if ($o{update}) {
+
+    # Updating means we have to get a write lock.
+    unless (defined($lock = getlock($o{file}, "WRITE", 1))) {
+      die "Failed to get write lock\n";
+    }
+    open ($ofh, ">", "$o{file}.new")
+      or die "failed to open output file: $!\n";
+
+  } else {
+
+    # If not updating, a short-lived read lock will do. This doesn't
+    # work very well if the slurp option isn't set, but I'll worry
+    # about that later if I ever *don't* want to slurp (probably by
+    # tweaking the read lock semantics)
+    unless (defined($lock = getlock($o{file}, "READ", 1))) {
+      die "Failed to get read lock\n";
+    }
+
+  }
+
+  # We need to allow for the case where there the input file doesn't
+  # exist. Rather than do something like opening /dev/null instead (so
+  # we have a filehandle to work with when we're not slurping) I'll
+  # silently switch to slurp mode and use an empty list.
+  $o{slurp} = 1 unless -f $o{file};
+
+  # default consume closure for A corresponds to slurping an empty or
+  # nonexistent file
+  $consume_a = sub { return undef };
+
+  if (-f $o{file}) {
+
+    # file exists, but can we open it?
+    open ($ifh, "<", $o{file})
+      or die "failed to open input file: $!\n";
+
+    # different closures depending on slurp setting
+    if ($o{slurp}) {
+      @A = (<$ifh>);
+      close $ifh;
+      $ifh = undef;		# so we don't try to close it later
+      $consume_a = sub { shift @A };
+
+      unless ($o{update}) {
+	close $lock;
+	$lock = undef;
+      }
+    } else {
+      $consume_a = sub { <$ifh>	};
+    }
+  }
 
   # define aliases for the more commonly-used callbacks
   my $compare    = $o{compare};
@@ -1269,12 +1332,24 @@ sub do_diff {
     ($b,$cancel) = &$consume_b();
   }
 
+  # various cleanups depend on whether we're updating, cancelling or
+  # still have a (non-slurped) read or write lock
+  if ($o{update} and defined($cancel)) {
+    # roll back update
+    close $ofh;
+    unlink "$o{file}.new";
+  } elsif ($o{update}) {
+    close $ofh;
+    rename "$o{file}", "$o{file}.old";
+    rename "$o{file}.new", "$o{file}"
+  }
 
-
+  close $ifh  if defined($ifh);
+  close $lock if defined($lock);
 }
 
 sub spider_read_dir {
-  my $url = shift;
+  my $url = ODROIDROOTURL . shift;
   # read in this directory and extract a list of contents
   # for convention, we'll use "dir/" and "file"
   return ("sorted list of urls")
@@ -1286,8 +1361,15 @@ sub spider_read_file {
   return ("some structure");
 }
 sub spider {
-  my $baseurl = shift;
-  my @queue   = (spider_read_dir(ODROIDROOTURL . "/"));
+
+
+  die "Modules required to spider are not available!\n"
+    unless $spider_support;
+
+  # we save memory by omitting the base ODROID site URL, which is
+  # implicitly added whenever we actually try to download something.
+  my $url = "/";
+  my @queue   = (spider_read_dir($url));
 
   # set up signal handler
   my $intr = undef;
@@ -1317,14 +1399,15 @@ sub spider {
 	  matching => sub {
 	    # update an existing record
 	  },
-	  # consume does the same as shifting one element from
-	  # the queue, but if it's a dir, we also look up the 
-	  # contents and prepend them
+	  # consume does the same as shifting one element from the
+	  # queue, but if it's a dir, we also look up the contents and
+	  # prepend them. This should preserve sort ordering in the
+	  # file so long as "foo/" is less than "foo/bar"
 	  consume  => sub {
 	    my $item = shift(@queue);
 	    if (defined($item) and !$intr) {
 	      if ($item =~ m|.*/$|) {
-		unshift @queue, spider_read_dir("$baseurl/$item");
+		unshift @queue, spider_read_dir("$url/$item");
 	      }
 	    }
 	    return ($item,$intr);
