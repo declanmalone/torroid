@@ -819,12 +819,6 @@ sub dump_tags {
   }
 }
 
-# 
-sub apply_tags {
-
-}
-
-
 # Since I've discovered that I don't have enough space on my VPS to
 # mirror the entire odroid download site, I have to be able to
 # selectively delete files. However, there are some provisos and other
@@ -1080,103 +1074,6 @@ sub getlock {
   return undef;
 }
 
-# the following two routines are intended to provide abstract
-# implementations for reading and updating a sorted list of data items
-# stored in a file using the above lock routine to guarantee
-# consistency. It is totally generic and allows us to build any kind
-# of filter that reads or updates our cache file. To be this generic,
-# it uses a few advanced techniques such as closures, callbacks and
-# continuations. The best way to understand how this works is to look
-# at the routines that implement different filters using it.
-# Alternatively, look up the documentation for Algorithm::Diff, which
-# solves a version of the problem in a similar way.
-sub sorted_diff_filter {
-
-  my %o = (
-	   file   => undef,
-	   update => 0,
-	   @_
-	  );
-
-  # throughout this code, the "a" variables relate to the file being
-  # read/updated, while the "b" variables relate to the custom list
-  # supplied by the caller
-
-  my $ahash = {};
-  my ($lock);
-
-  if ($o{update}) {
-
-    my ($ifh,$ofh);
-    unless (defined($lock = getlock($o{file}, "WRITE", 1))) {
-      die "Failed to get write lock\n";
-    }
-    open ($ifh, "<", $o{file})
-      or die "failed to open input file: $!\n";
-    open ($ofh, ">", "$o{file}.new")
-      or die "failed to open output file: $!\n";
-    $ahash->{ifh}  = $ifh;
-    $ahash->{ofh}  = $ofh;
-    $ahash->{lock} = $lock;
-
-  } else {
-
-    # for reading the file, we use a short-lived read filter and slurp
-    # the whole file in. Slurping doesn't scale well and it makes it
-    # so that we have to implement different versions of read, eof and
-    # so on, but (a) I don't expect the file list to be that big, and
-    # (b) I want to use closures to encapsulate file methods anyway,
-    # so it's not a big deal that we have a different implementation
-    # here.
-
-    my ($fh,@contents);
-    unless (defined($lock = getlock($o{file}, "READ", 1))) {
-      die "Failed to get read lock\n";
-    }
-    if (-f $o{file}) {
-      open ($fh, "<", $o{file})
-	or die "failed to open input file: $!\n";
-      @contents = (<$fh>);
-      close $fh;
-    } else {
-      @contents = ();
-    }
-    
-
-    # 
-    $ahash->{lock} = undef;
-
-  }
-
-
-  # read from new list
-
-  do {
-
-    # read again  from new list
-  } while ("read new data");
-
-  if ("new has") {
-  }
-
-}
-
-sub diffing_update_filter {
-
-
-}
-
-
-# master routine 
-sub update_crawler_cache {
-  my %o = (
-	   docrawl => 0,
-	   @_,
-	  );
-
-
-}
-
 
 # mirror does not require any updates to our cache so we don't need to
 # go get a write lock on it. We do need to get a read lock, though, so
@@ -1412,14 +1309,8 @@ sub spider_read_dir {
   # for convention, we'll use "dir/" and "file"
   return (sort { $a cmp $b } @links);
 }
-sub spider_read_file {
-  my $url = shift;
-  # read in metadata for a file, in particular the size and
-  # modification time
-  return ("some structure");
-}
-sub spider {
 
+sub spider {
 
   die "Modules required to spider are not available!\n"
     unless $spider_support;
