@@ -31,7 +31,17 @@ my @trackers = (
   "http://open.tracker.thepiratebay.org/announce",
 );
 
+# cache file is a list of files on the main http server. Each line is
+# a null-separated list of the filename and the attributes whose
+# indexes are listed below
 use constant CACHEFILE => "/home/torrent/.otorrent-cache";
+use constant CMTIME    => 1;
+use constant CSIZE     => 2;
+
+# some useful stat-related constants
+use constant SMODE     => 2;
+use constant SSIZE     => 7;
+use constant SMTIME    => 9;
 
 # external programs follow
 use constant BTMAKEMETAFILE => '/usr/bin/btmakemetafile';
@@ -67,19 +77,22 @@ use File::Copy;
 use Fcntl qw(:DEFAULT :flock);
 use Digest::MD5;
 
-# The following is intended to test whether we have support for
-# extended attributes. I'm leaning more and more towards making xattr
-# support mandatory, but since there are still some things that the
-# script can do without it (and since the code below is useful) I'm
-# leaving the checks in here.
+# Optional modules (flags are set if we have working module support)
 my $xattr_support;
+my $spider_support;
+my $rpc_support;
+
+# Test for extended attribute support. I'm leaning towards making
+# xattr support mandatory, but since there are still some things that
+# the script can do without it (and since the code below is useful)
+# I'm leaving the checks in here.
 
 BEGIN {
   $xattr_support = 0;
   if ( eval { require File::ExtAttr } ) {
     File::ExtAttr->import(':all');
 
-    # the module is loaded now as if we'd done 'use File::ExtAttr',
+    # The module is loaded now as if we'd done 'use File::ExtAttr',
     # but we have to check whether the filesystem actually supports
     # extended attributes. The man page for the module suggests that
     # the getfattr routine emits a warning in cases other than the
@@ -129,7 +142,6 @@ BEGIN {
 # I'll also check for the availability of the various modules needed
 # for doing web crawling on the odroid site. Without them, we won't be
 # able to crawl the site or mirror files from it.
-my $spider_support;
 
 BEGIN {
   $spider_support = 0;
@@ -165,7 +177,6 @@ BEGIN {
 # Incidentally, I could equally have used IPC::PerlSSH instead of
 # GRID::Machine, but I chose the latter since it's newer and more
 # fully-featured.
-my $rpc_support;
 
 BEGIN {
   $rpc_support = 0;
@@ -325,7 +336,8 @@ sub extract_info_hash {
 
 # By default make_torrent_file will create the output torrent file in
 # the same directory as the input file and apply a "Downloaded from
-# <url>" comment (which can be overridden)
+# <url>" comment. Both behaviours can be overridden with suitable
+# options.
 sub make_torrent_file {
 
   my %o = (
@@ -584,7 +596,7 @@ sub start_torrent {
   # doing the add ... in older versions of transmission-remote anyway.
   system @command;
 
-  # it can't hurt include --download-dir option when adding too
+  # it can't hurt to include --download-dir option when adding too
   @command = (@base_xmission_command,
 	      "--download-dir", $download_dir,
 	      "--add", $absfile);
@@ -596,7 +608,7 @@ sub start_torrent {
 
 # Due to the way transmission-remote works, we can't just give it a
 # torrent name and ask it to stop it. Instead, we have to look it up
-# by its torrent ID (see the list command here) or giving it the
+# by its torrent ID (see the list command here) or give it the
 # torrent's info_hash. Here I try to use the stored info_hash first
 # and if that fails, it re-extracts it from the torrent file.
 sub stop_torrent {
@@ -1435,6 +1447,8 @@ sub spider {
 
     my $rel = shift;
     my $url = ODROIDROOTURL . $rel;
+    my $existing = shift || '';
+    my @fields   = split("\0",$existing);
 
     if ($rel=~m|/$|) {
       print $fh "$rel\n";
@@ -1443,7 +1457,9 @@ sub spider {
 	  $expires, $server) = head($url);
       die "Failed to get header info for $url\n" unless defined($content_type);
       warn "Adding file info for $rel\n";
-      print $fh "$rel\0$modified_time\0$document_length\n";
+      $fields[0]            = $rel;
+      @fields[CMTIME,CSIZE] = ($modified_time,$document_length);
+      print $fh join("\0",@fields) . "\n";
     }
 
   };
@@ -1468,10 +1484,10 @@ sub spider {
 	    save_header_info($b);
 	  },
 	  matching => sub {
-	    # update an existing record
+	    # update an existing record (saving any existing fields)
 	    my ($a,$b) = @_;
 	    warn "Got matching item: $b\n";
-	    save_header_info($b);
+	    save_header_info($b,$a);
 	  },
 	  # consume does the same as shifting one element from the
 	  # queue, but if it's a dir, we also look up the contents and
@@ -1618,8 +1634,6 @@ if ($command eq "make") {
 
   my $file = (convert_filename(shift @ARGV))[0];
   unblock_file($file);
-
-
 
 } elsif ($command eq "blocked") {
 
