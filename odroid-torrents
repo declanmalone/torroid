@@ -1216,7 +1216,7 @@ sub do_diff {
 
 	   # default callbacks don't do much at all
 	   init     => sub { },
-	   compare  => sub { my ($a,$b) = @_; return $a cmp $b },
+	   key      => sub { my $k = shift; chomp $k; return $k },
 	   insert_a => sub { },
 	   insert_b => sub { },
 	   matching => sub { },
@@ -1295,7 +1295,7 @@ sub do_diff {
 
   # define aliases for the more commonly-used callbacks (less unweildy
   # than the syntax in the line above!)
-  my $compare    = $o{compare};
+  my $key        = $o{key};
   my $insert_a   = $o{insert_a};
   my $insert_b   = $o{insert_b};
   my $matching   = $o{matching};
@@ -1306,16 +1306,20 @@ sub do_diff {
                                 # cancel an update
 
   ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
+  chomp $a;
 
   while (defined($a) and defined($b) and !defined($cancel)) {
-    my $tilt = &$compare($a,$b);
+    my $tilt = (&$key($a) cmp $b);
     if ($tilt == -1) {		# $a < $b
       &$insert_a($a);
       $a = &$consume_a();
+      chomp $a;
     } elsif ($tilt == 0) {	# $a = $b
+      #warn "Match '$a' with '$b'\n";
       &$matching($a,$b);
       # advance in both lists
       ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
+      chomp $a;
     } elsif ($tilt == +1) {	# $a > $b
       &$insert_b($b);
       ($b,$cancel) = &$consume_b();
@@ -1324,6 +1328,7 @@ sub do_diff {
   while (defined($a) and !defined($cancel)) {
     &$insert_a($a);
     $a = &$consume_a();
+    chomp $a;
   }
   while (defined($b) and !defined($cancel)) {
     &$insert_b($b);
@@ -1401,7 +1406,7 @@ sub spider {
 
   # output file handle sent back in init callback
   my ($fh);
-  $|++;
+  #$|++;
 
   # since callbacks for insert_b and matching both effectively do the
   # same work, I factor that out here.
@@ -1427,10 +1432,11 @@ sub spider {
 	  list     => \@queue,
 	  # we get a callback after do_diff finishes setting up files
 	  init     => sub { ($fh) = @_; warn "INIT callback\n"},
-	  compare  => sub {
-	    my ($a,$b) = @_;
-	    $a = s/\0.*//;    # strip extra cached data
-	    return $a cmp $b;
+	  key      => sub {
+	    my ($key) = @_;
+	    chomp $key;
+	    $key =~ s/\0.*//;    # strip extra cached data
+	    return $key;
 	  },
 	  # warn about deleted records
 	  insert_a => sub { warn  shift . " disappeared from site\n"; },
@@ -1442,7 +1448,7 @@ sub spider {
 	  },
 	  matching => sub {
 	    # update an existing record
-	    my ($a,$b) = shift;
+	    my ($a,$b) = @_;
 	    warn "Got matching item: $b\n";
 	    save_header_info($b);
 	  },
