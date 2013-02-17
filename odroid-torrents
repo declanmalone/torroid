@@ -687,10 +687,10 @@ sub md5_digest {
 
     my $ctx = Digest::MD5->new;
     $ts = time();	# time from start of hashing
-    open "<", $file or die "MD5: failed to open file: $!\n";
+    open FH, "<", $file or die "MD5: failed to open file: $!\n";
     binmode(FH);	# to be safe (though Linux shouldn't need it)
-    $ctx->addfile(FH);
-    close FH;
+    $ctx->addfile(*FH); # needs a typeglob, apparently
+    close(FH);
     $hash = $ctx->hexdigest;
 
     # save the hash and timestamp
@@ -1706,8 +1706,8 @@ if ($command eq "make") {
   my $file  = shift;
   my $sfile = (convert_filename($file))[0];
 
-  my $sum = md5sum($sfile)
-  print "$file: $sum\n";
+  my $sum = md5_digest($sfile);
+  print "$sfile: $sum\n";
 
 } elsif ($command eq "spider") {
 
