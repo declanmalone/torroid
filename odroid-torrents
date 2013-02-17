@@ -670,10 +670,36 @@ sub reindex {
 
 }
 
-# 
+# Operates on source files and caches result in xattrs (if available)
 sub md5_digest {
 
+  my $file = shift;
 
+  my ($hash,$ts) = ("-");
+  if (-f $file) {
+    # skip calculating hash if an up-to-date hash is stored in xattrs
+    if ($xattr_support) {
+      if (defined($ts = getfattr($file, XATTRTAG . "md5.ts"))) {
+	$hash = getfattr($file, XATTRTAG . "md5.hash");
+	return $hash if defined($hash) and $ts >= ((stat $file)[9]);
+      }
+    }
+
+    my $ctx = Digest::MD5->new;
+    $ts = time();	# time from start of hashing
+    open "<", $file or die "MD5: failed to open file: $!\n";
+    binmode(FH);	# to be safe (though Linux shouldn't need it)
+    $ctx->addfile(FH);
+    close FH;
+    $hash = $ctx->hexdigest;
+
+    # save the hash and timestamp
+    if ($xattr_support) {
+      setfattr($file, XATTRTAG . "md5.hash", $hash) or die;
+      setfattr($file, XATTRTAG . "md5.ts",   $ts)   or die;
+    }
+  }
+  return $hash;
 }
 
 # Since I'm spreading my seeding across several hosts, I need a way of
@@ -1274,7 +1300,7 @@ sub do_diff {
 
     # set up closure depending on slurp setting
     if ($o{slurp}) {
-      @A = (<$ifh>);
+      @A = map { chomp; $_ } (<$ifh>);
       close $ifh;
       $ifh = undef;		# so we don't try to close it later
       $consume_a = sub { shift @A };
@@ -1284,8 +1310,7 @@ sub do_diff {
 	$lock = undef;
       }
     } else {
-      # scalar stops us accidentally slurping in a list context
-      $consume_a = sub { scalar <$ifh> };
+      $consume_a = sub { my $l = <$ifh>; chomp $l; $l };
     }
   }
 
@@ -1306,20 +1331,17 @@ sub do_diff {
                                 # cancel an update
 
   ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
-  chomp $a;
 
   while (defined($a) and defined($b) and !defined($cancel)) {
     my $tilt = (&$key($a) cmp $b);
     if ($tilt == -1) {		# $a < $b
       &$insert_a($a);
       $a = &$consume_a();
-      chomp $a;
     } elsif ($tilt == 0) {	# $a = $b
       #warn "Match '$a' with '$b'\n";
       &$matching($a,$b);
       # advance in both lists
       ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
-      chomp $a;
     } elsif ($tilt == +1) {	# $a > $b
       &$insert_b($b);
       ($b,$cancel) = &$consume_b();
@@ -1328,7 +1350,6 @@ sub do_diff {
   while (defined($a) and !defined($cancel)) {
     &$insert_a($a);
     $a = &$consume_a();
-    chomp $a;
   }
   while (defined($b) and !defined($cancel)) {
     &$insert_b($b);
@@ -1676,6 +1697,17 @@ if ($command eq "make") {
     system ("rsync", "-avX", WEBROOT . "/", "$m:" . WEBROOT)
       and die "rsync failed: $?\n";
   }
+
+} elsif ($command eq "md5sum") {
+
+  unless ($xattr_support) {
+    warn "MD5 Sums will not be saved (no xattr support)\n";
+  }
+  my $file  = shift;
+  my $sfile = (convert_filename($file))[0];
+
+  my $sum = md5sum($sfile)
+  print "$file: $sum\n";
 
 } elsif ($command eq "spider") {
 
