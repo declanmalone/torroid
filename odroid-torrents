@@ -350,6 +350,25 @@ sub extract_info_hash {
   return $info_hash;
 }
 
+# in a couple of places we need to check if an output/destination file
+# exists so that we can avoid overwriting it unless we want to force
+# the recreation. This routine handles that.
+sub newer_exists {
+
+  my ($source,$target) = @_;
+  return 0 unless -f $target;
+
+  my $ttime = (stat(_))[SMTIME];
+
+  # catch potential programming errors in calling routines
+  die "newer_exists: original file doesn't exist!" unless -f $source;
+
+  my $stime = (stat(_))[SMTIME];
+
+  return ($stime <= $ttime) ? 1 : 0;
+}
+
+
 # By default make_torrent_file will create the output torrent file in
 # the same directory as the input file and apply a "Downloaded from
 # <url>" comment. Both behaviours can be overridden with suitable
@@ -357,9 +376,10 @@ sub extract_info_hash {
 sub make_torrent_file {
 
   my %o = (
-	   infile => undef,	# required
+	   infile  => undef,	# required
 	   comment => "default",# or set to undef -> no comment
 	   outfile => undef,
+	   force   => 0,
 	   @_
 	  );
 
@@ -763,6 +783,8 @@ sub check_file {
     warn "No xattr support; check_file can't cache results\n"
       unless $xattr_support;
   }
+
+  my $file = shift;
 
   my $check_method = undef;
   my @check_command = ();
@@ -1317,7 +1339,7 @@ sub do_mirror {
 }
 
 
-# wrapper routine that 
+# wrapper routine that
 sub coverage {
 
 
@@ -1618,6 +1640,48 @@ sub spider {
 	 );
 }
 
+# crontask puts everything together in one pipeline
+sub crontask {
+
+  die "crontask needs spider support!\n" unless $spider_support;
+
+  spider;
+  do_mirror;
+
+  do_diff
+    (
+     # all our work is done in insert_a callback (default callbacks
+     # and other options work fine for us)
+     insert_a => sub {
+       my $a = shift;
+       my $f = SRCROOT . $a;
+
+       # skip directories
+       return if $a =~ m|/$|;
+
+       # skip missing or blocked files
+       return unless -f $f;
+       return if is_blocked($f);
+
+       # hash (skipped, as it's done in check step anyway)
+       #md5_digest($f);
+
+       # check
+       unless (check($f)) {
+	 warn "Failed check: $f\n";
+       }
+
+       # make
+       make_torrent_file(infile => 
+       # publish
+       # start
+
+     },
+    );
+
+  # rebuild index.html files
+
+}
 
 
 my $prog = $0; $prog =~ s|.*/||;
@@ -1701,6 +1765,15 @@ $prog xtracker
   Tell transmission to use our current tracker list for all active
   torrents. This lets you continue seeding even if the torrent files
   have been changed to include new tracker info.
+
+$prog crontask
+
+  Does the entire pipeline of tasks: spider, mirror, check, make,
+  publish and start. Suitable for running periodically as a cron task.
+  This honours any blocks on downloading and runs make and publish
+  without the force option, so torrents won't be updated unless they
+  changed on the master site. If a file fails any check then it won't
+  be processed either.
 
 EOT
 
