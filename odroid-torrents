@@ -28,7 +28,12 @@ my @trackers = (
   "udp://fr33domtracker.h33t.com:3310/announce",
   "http://fr33dom.h33t.com:3310/announce",
   "http://www.sumotracker.com/announce",
+  "udp://tracker.istole.it:80",
+  "udp://tracker.ccc.de:80",
   "http://open.tracker.thepiratebay.org/announce",
+  # the following site apparently requires files be registered (ie,
+  # not an open tracker):
+  # "http://linuxtracker.org:2710/00000000000000000000000000000000/announce",
 );
 
 # cache file is a list of files on the main http server. Each line is
@@ -164,8 +169,19 @@ BEGIN {
     }
   }
 
-  # we need both modules; one is not enough
-  $spider_support = 0 unless $spider_support == 2;
+  # LWP::Simple's get and mirror methods are too simple if we want to
+  # be able to continue a download. For that we need LWP::UserAgent
+  if ( eval { require LWP::UserAgent } ) {
+    LWP::UserAgent->import();
+
+    # add more custom tests if needed ...
+    if (1) {
+      ++$spider_support;
+    }
+  }
+
+  # we need all modules; one is not enough
+  $spider_support = 0 unless $spider_support == 3;
 }
 
 # While we can do mirroring using just the web modules, if we want to
@@ -662,7 +678,7 @@ sub list_torrents {
 # depth-first mode and this would invalidate the cache for many
 # accesses. Plus, there shouldn't be too many .md5sum files, so
 # storing all of them shouldn't ever be a problem.
-my %md5_cache = ();	# dir => file => hash
+my %md5_cache = ();	# dir => file => md5sum
 
 sub official_md5_info {
   my $file = shift;		# assumed to be absolute
@@ -678,13 +694,17 @@ sub official_md5_info {
 
   unless (exists $md5_cache{$dirpart}) {
 
-    # traverse the directory looking for *.md5sum files
+    # Scan the directory looking for *.md5sum files
 
-    # Perl's standard glob and <*.c> operators are a bit lacking since
+    # By setting up an empty hash for this dir here and now, it means
+    # that we only scan it once (think of it as caching negative hits)
+    $md5_cache{$dirpart} = {};
+
+    # Perl's standard glob() and <*> operators are a bit lacking since
     # they fail on filenames that have spaces in them. Rather than use
-    # File::Glob (which has bsd_glob, which gets around that problem)
-    # and introduce another dependency, I'll use the standard opendir
-    # and readdir keywords.
+    # File::Glob (bsd_glob) to get around that problem (and introduce
+    # another dependency), I'll use the standard opendir and readdir
+    # keywords instead.
     opendir (DIR, SRCROOT . "/$dirpart") || die;
     my ($f);
     while ($f = readdir DIR) {	# while(readdir DIR) needs perl >= 5.11.2
@@ -700,7 +720,6 @@ sub official_md5_info {
 	  chomp;
 	  if (/^([0-9a-fA-f]+)\s+(.*)/) {
 	    my ($thisfile,$thishash) = ($2,$1);
-	    $md5_cache{$dirpart} = {} unless exists $md5_cache{$dirpart};
 	    $md5_cache{$dirpart}->{$thisfile} = $thishash;
 	  } else {
 	    warn "offical_md5_info: $full: invalid .md5sum file format\n";
@@ -722,9 +741,10 @@ sub official_md5_info {
     }
   }
 
-  # For no match, return the null string instead of undef. This makes
+  # For no match, return an empty string instead of undef. This makes
   # it easier for the calling program to use, since they can just
-  # write if ($hash eq offical_md5_info($f)) { ... }
+  # write if ($hash eq offical_md5_info($f)) { ... } and not generate
+  # warnings about an "uninitialized value" in the comparison.
   return '';
 }
 
@@ -1155,25 +1175,145 @@ sub getlock {
   return undef;
 }
 
+# a quick conversion from bytes to kbytes, etc.
+sub human_readable {
+  my $n = shift;
+  my $u;
+  my @units = qw(KB MB GB TB PB);
+  return "${n} B" if $n <1024;
+  while ($u = shift @units) {
+    $n /= 1024;
+    if ($n < 1024) {
+      return sprintf("%.2f ",$n) . $u;
+    }
+  }
+  return sprintf("%.2f ",$n ) . "PB";
+}
+
+# wrapper around LWP::UserAgent to resume download
+sub download_url {
+
+  my %o=(
+	 url => undef,
+	 file => undef,
+	 tries => 5,
+	 verbose => undef,
+	 @_
+	);
+
+  die "download_url needs an url => var parameter\n" unless defined($o{url});
+  die "download_url needs a file => var parameter\n" unless defined($o{file});
+  $o{verbose} = 0 unless defined($o{verbose});
+
+  my $size = 0;
+
+  for (1..$o{tries}) {
+
+    # check file's size within loop, since it may change
+    if (-f $o{file}) {
+      $size = (stat(_))[SSIZE];
+    }
+
+    my ($ua,$rc);
+    $ua = LWP::UserAgent->new;
+    $rc =$ua->get($o{url},
+		  ':content_file' => $o{file},
+		  'Range' => "$size-");
+    #    warn "return value $rc\n";
+    my $code = $rc->code;
+    if ($rc->is_success) {
+      warn "OK   ($code ". $rc->message .") : $o{url}\n" if $o{verbose};
+      return 1;			# return success
+    }
+
+    # warn about failure and try again
+    warn "FAIL ($code ". $rc->message .") $o{url}\n" if $o{verbose};
+
+    # we might want additional checks here to account for specific
+    # error returns like 404 (not found) or 416 (range not
+    # satisfiable) that are unrecoverable so that we don't end up
+    # trying them repeatedly. For now I'll just bail on 404s.
+    if ($code == 404) {
+      warn "Giving up on unrecoverable $code error\n" if $o{verbose};
+      return 0;
+    }
+
+  }
+
+  # return failure
+  return 0;
+}
+
 
 # mirror does not require any updates to our cache so we don't need to
 # go get a write lock on it. We do need to get a read lock, though, so
 # that our input file is in a consistent state even if a writer
 # happens to replace the file while we're reading it.
 
-sub mirror_file {}
-sub mirror_dir {}
+# we have to call this something other than "mirror" due to a
+# conflicting name exported by the LWP::Simple module.
+sub do_mirror {
 
-sub mirror_file_or_dir {
-
-  my $uri = shift;		# not exactly a URI, but close enough
+  my $rooturl = shift;		# not exactly a URI, but close enough
+  $rooturl = ODROIDROOTURL unless defined($rooturl);
 
   die "Modules required to mirror are not available!\n"
     unless $spider_support;
 
-  # 
-  if (ODROIDROOTURL eq substr $uri, $[, $[ + length ODROIDROOTURL) {
+  unless (ODROIDROOTURL eq substr $rooturl, $[, $[ + length ODROIDROOTURL) {
+    die "do_mirror: expected URL starting with " . ODROIDROOTURL . "\n";
   }
+
+  do_diff
+    (
+     # all our work is done in insert_a callback (default callbacks
+     # and other options work fine for us)
+     insert_a => sub {
+       my $filerec = shift;
+       my ($rel,$mtime,$size) = (split "\0", $filerec)[0,CMTIME,CSIZE];
+
+       my $file = SRCROOT . $rel;
+       my $url  = ODROIDROOTURL . $rel;
+
+       #warn "$file:\n";
+       if ($file =~ s|/$||) {
+	 make_path($file, { mode => 0775 }) unless -d $file;
+       } else {
+	 # LWP::Simple's mirror routine checks mtimes, but since we've
+	 # cached the value, we use that to avoid an unnecessary web
+	 # access
+	 my $need_update = 1;
+	 my ($local_mtime,$local_size)=(0,0);
+	 if (-f $file) {
+	   ($local_mtime,$local_size) = (stat(_))[SMTIME,SSIZE];
+	   if ($local_size == $size and $local_mtime >= $mtime) {
+	     $need_update = 0;
+	   }
+	 }
+	 return unless $need_update;
+
+	 warn "Mirroring $rel (" . human_readable($size) . ", have ".
+	   (sprintf("%.2f", ($local_size * 100/$size))) . "%)\n";
+	 # return;
+
+	 # LWP::Simple's mirror doesn't support ranges, so I'm not using it
+	 if ("LWP::Simple" eq "preferred") {
+
+	   my $rc = mirror($url,$file);
+
+	   if (is_success($rc)) {
+	     warn "$rc (success): $file\n";
+	   } else {
+	     warn "$rc (fail) $file: " . status_message($rc). "\n";
+	   }
+	 } else {
+
+	   # use my sub that uses LWP::UserAgent instead
+	   download_url(url => $url, file => $file) or warn "$url failed\n";
+	 }
+       }
+     },
+    );
 }
 
 
@@ -1218,9 +1358,9 @@ sub coverage {
 # provided by the calling program.
 sub do_diff {
 
-  # need to predeclare $B so that we can implement our default consume
+  # Need to predeclare $B so that we can implement our default consume
   # callback below. Perl doesn't let us refer to $o{list} from within
-  # the definition of %o itself, so I use @$B instead as a workaround.
+  # the definition of %o itself, so I refer to it indirectly using $B.
   my $B;
   my %o = (
 	   # A default value of file => undef below would make the
@@ -1318,7 +1458,7 @@ sub do_diff {
 
   my ($a,$b);
   my $cancel = undef;		# consume callback can notify us to
-                                # cancel an update
+                                # cancel an update (eg, hit Ctrl-C)
 
   ($a,$b,$cancel) = (&$consume_a(), &$consume_b());
 
@@ -1346,8 +1486,8 @@ sub do_diff {
     ($b,$cancel) = &$consume_b();
   }
 
-  # various cleanups depend on whether we're updating, cancelling or
-  # still have a (non-slurped) read or write lock
+  # various cleanups depending on whether we're updating, cancelling
+  # or still have a (non-slurped) read or write lock
   if ($o{update} and defined($cancel)) {
     # roll back update
     close $ofh;
@@ -1663,7 +1803,7 @@ if ($command eq "make") {
 
   # copy this script to the bin dir of each slave machine
   for my $m (@slaves) {
-    `scp $0 $m:bin`;
+    `scp $0 $m:bin/`;
   }
 
 } elsif ($command eq "websync") {
@@ -1699,12 +1839,27 @@ if ($command eq "make") {
 
   spider;
 
+} elsif ($command eq "mirror") {
+
+  do_mirror;
+
+} elsif ($command eq "human") {
+
+  foreach (1023,1024,1024**2,1024**3,1024**4,1024**5,1024**6) {
+    print human_readable($_) . "\t$_\n";
+  }
+
 } elsif ($command eq "omd5") {	# check official md5
 
   my $file = (convert_filename(shift @ARGV))[0];
 
   my $hash = official_md5_info($file);
   print "Official MD5: '$hash'\n";
+
+} elsif ($command eq "dltest") {	# test download
+
+  download_url(url => 'http://euler/10Mb', file => './10Mb', verbose => 1) 
+    || warn "total failure\n";
 
 } else {
 
