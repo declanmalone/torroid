@@ -353,7 +353,7 @@ sub extract_info_hash {
 # in a couple of places we need to check if an output/destination file
 # exists so that we can avoid overwriting it unless we want to force
 # the recreation. This routine handles that.
-sub newer_exists {
+sub newer_target {
 
   my ($source,$target) = @_;
   return 0 unless -f $target;
@@ -361,7 +361,7 @@ sub newer_exists {
   my $ttime = (stat(_))[SMTIME];
 
   # catch potential programming errors in calling routines
-  die "newer_exists: original file doesn't exist!" unless -f $source;
+  die "newer_target: original file doesn't exist!" unless -f $source;
 
   my $stime = (stat(_))[SMTIME];
 
@@ -393,6 +393,8 @@ sub make_torrent_file {
   die "make_torrent_file: file '$o{infile} doesn't exist\n"
     unless -f $o{infile};
 
+  # skip unforced re-creation or if the file is blocked.
+  return if (newer_target($o{infile},$o{outfile}) and !$o{force});
   if (is_blocked($o{infile})) {
     warn "make_torrent_file: skipping blocked file $o{infile}\n";
     return;
@@ -559,14 +561,12 @@ sub truncate_file {
 }
 
 
-# publish_torrent has two different modes:
-# force   ->  copy the torrent into the www directory unconditionally
-# update  ->  copy torrent if it is newer than file in www dir
+# publish_torrent
 sub publish_torrent {
 
   my %o = (
-	   file => undef,
-	   mode => "update",
+	   file  => undef,
+	   force => 0,
 	   @_
 	  );
 
@@ -580,15 +580,7 @@ sub publish_torrent {
     return;
   }
 
-  if ($o{mode} eq "update") {
-    if (-f $target) {
-      my $source_mtime = (stat $source)[9];
-      my $target_mtime = (stat $target)[9];
-      return if $target_mtime >= $source_mtime;
-    }
-  } elsif ($o{mode} ne "force") {
-    die "publish_torrent: unknown mode $o{mode}";
-  }
+  return if (!$o{force} and newer_target($source,$target));
 
   copy($source,$target) or
     die "publish_torrent: copy $source, $target failed: $!\n";
@@ -1590,7 +1582,7 @@ sub spider {
       my ($content_type, $document_length, $modified_time,
 	  $expires, $server) = head($url);
       die "Failed to get header info for $url\n" unless defined($content_type);
-      warn "Adding file info for $rel\n";
+      #warn "Adding file info for $rel\n";
       $fields[0]            = $rel;
       @fields[CMTIME,CSIZE] = ($modified_time,$document_length);
       print $fh join("\0",@fields) . "\n";
@@ -1610,17 +1602,17 @@ sub spider {
 	    return $key;
 	  },
 	  # warn about deleted records
-	  insert_a => sub { warn (shift) . " disappeared from site\n"; },
+	  insert_a => sub { warn "- " . (shift) . "\n"; },
 	  insert_b => sub {
 	    # this is a new dir/file
 	    my $b = shift;
-	    #warn "Got insert_b item: $b\n";
+	    warn "+ $b\n";
 	    save_header_info($b);
 	  },
 	  matching => sub {
 	    # update an existing record (saving any existing fields)
 	    my ($a,$b) = @_;
-	    warn "Got matching item: $b\n";
+	    warn "= $b\n";
 	    save_header_info($b,$a);
 	  },
 	  # consume does the same as shifting one element from the
@@ -1640,41 +1632,79 @@ sub spider {
 	 );
 }
 
-# crontask puts everything together in one pipeline
-sub crontask {
+# crontask puts everything together in one pipeline (split out into
+# remote and local parts for easier testing)
+sub crontask_remote {
 
   die "crontask needs spider support!\n" unless $spider_support;
 
   spider;
   do_mirror;
 
+}
+
+sub crontask_local {
+
+  my ($fh);
   do_diff
     (
-     # all our work is done in insert_a callback (default callbacks
-     # and other options work fine for us)
+     # We will update the cache to include any new hashes, check
+     # status and the like.
+     update   => 1,
+     init     => sub { ($fh) = @_; },
+     key      => sub {
+       my ($key) = @_;
+       chomp $key;
+       $key =~ s/\0.*//;    # strip extra cached data
+       return $key;
+     },
+     # All our work is done in insert_a callback.
      insert_a => sub {
        my $a = shift;
-       my $f = SRCROOT . $a;
+       chomp $a;		# TODO: delete useless chomps
+       my @A = split("\0",$a);
+       my $f = SRCROOT . $A[0];
 
-       # skip directories
-       return if $a =~ m|/$|;
+       # skip directories (writing original record back out
+       # unmodified)
+       if ($a =~ m|/$|) {
+	 print $fh "$a\n";
+	 return;
+       }
+
+       # extract any records that we might use or update
+       my ($cmtime,$csize) =
+	 @A[CMTIME,CSIZE];
+
 
        # skip missing or blocked files
-       return unless -f $f;
-       return if is_blocked($f);
+       goto cleanup unless -f $f;
+       goto cleanup if is_blocked($f);
 
        # hash (skipped, as it's done in check step anyway)
        #md5_digest($f);
 
-       # check
-       unless (check($f)) {
+       # 
+       unless (check_file($f)) {
 	 warn "Failed check: $f\n";
+	 goto cleanup;
        }
 
        # make
-       make_torrent_file(infile => 
+       make_torrent_file(infile => $f);
+
        # publish
+       publish_torrent(file => $f);
+
        # start
+       start_torrent($f);
+
+
+       # write the record plus any updates back out to the cache file
+     cleanup:
+       @A[CMTIME,CSIZE] =
+	 ($cmtime,$csize);
+       print $fh join("\0",@A) . "\n";
 
      },
     );
@@ -1929,10 +1959,19 @@ if ($command eq "make") {
   my $hash = official_md5_info($file);
   print "Official MD5: '$hash'\n";
 
-} elsif ($command eq "dltest") {	# test download
+} elsif ($command eq "dltest") {	# download test
 
   download_url(url => 'http://euler/10Mb', file => './10Mb', verbose => 1) 
     || warn "total failure\n";
+
+} elsif ($command eq "crontask") {
+
+  crontask_remote;
+  crontask_local;
+
+} elsif ($command eq "cronlocal") {
+
+  crontask_local;
 
 } else {
 
