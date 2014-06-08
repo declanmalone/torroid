@@ -78,7 +78,7 @@ my @slaves = (
 use Cwd qw(abs_path);
 use File::Path qw(make_path);
 use File::Find;
-use File::Copy;
+use File::Copy qw(cp);
 use Fcntl qw(:DEFAULT :flock);
 use Digest::MD5;
 
@@ -582,7 +582,7 @@ sub publish_torrent {
 
   return if (!$o{force} and newer_target($source,$target));
 
-  copy($source,$target) or
+  cp($source,$target) or
     die "publish_torrent: copy $source, $target failed: $!\n";
 
   # copy all our extended attributes to the target file
@@ -781,7 +781,7 @@ sub check_file {
   my $check_method = undef;
   my @check_command = ();
 
-  
+  return 1; # OK
 
 }
 
@@ -1229,10 +1229,15 @@ sub download_url {
     }
 
     my ($ua,$rc);
+    warn "downloading byte range $size-\n";
     $ua = LWP::UserAgent->new;
     $rc =$ua->get($o{url},
 		  ':content_file' => $o{file},
-		  'Range' => "$size-");
+		  'Range' => "$size-");	# Doesn't seem to work with
+                                        # older versions of the
+                                        # library. At least it doesn't
+                                        # complain.
+
     #    warn "return value $rc\n";
     my $code = $rc->code;
     if ($rc->is_success) {
@@ -1523,7 +1528,16 @@ sub spider_read_dir {
   #warn "Visiting '$rel'\n";
 
   my @links = ();
-  my $content = get($url);
+
+  # include a small number of retries to download the directory page
+  my $tries = 3;
+
+  my $content;
+  while (--$tries) {
+    $content = get($url);
+    last if defined($content)
+  }
+
   die "Failed to download $url\n" unless defined($content);
 
   my $h = HTML::LinkExtor->new
@@ -1532,9 +1546,26 @@ sub spider_read_dir {
        my($tag, %attr) = @_;
        return unless $tag =~ /^a$/i;
        my $href = $attr{href};
-       return unless $href =~ s|^$url||;
+       # following line was failing if url/href has () in it. Don't
+       # know why it's being interpolated twice.
+       #  unless ($href =~ s|^$url||) {
+
+       # After a bit of testing and a web search, it seems that this
+       # is the correct way to use regexp without it being
+       # double-interpolated:
+       #  unless ($href =~ s|^\Q$url\E||) {
+
+       # use the equivalent statement using substr instead:
+       my $prefix = substr $href,0, length $url, '';
+       unless ($prefix eq $url) {
+	 #warn "Not a child link: $href\n";
+	 #warn "url:  $url\n";
+	 #warn "href: $prefix$href\n"; # prefix was stripped by substr
+	 return;
+       }
        return if $href =~ m|^\?|;   # skip internal navigation links
        return if $href =~ m|^\.\.|; # skip parent link
+
        #warn " +link $rel$href\n";
        push @links, "$rel$href";
      }, $url);
@@ -1576,18 +1607,41 @@ sub spider {
     my $existing = shift || '';
     my @fields   = split("\0",$existing);
 
+    #warn "HEAD $url\n";
+
+    # save directory entry
     if ($rel=~m|/$|) {
       print $fh "$rel\n";
-    } else {
-      my ($content_type, $document_length, $modified_time,
-	  $expires, $server) = head($url);
-      die "Failed to get header info for $url\n" unless defined($content_type);
+      return;
+    }
+
+    # The code below was failing on URLs that didn't report a content
+    # type (e.g., .md5sum files). Previously, my code was working when
+    # it tested to see if content type was defined, but not any
+    # more. Changing the check to see if document_length is defined
+    # fixes that. Also, the first time I ran crontask overnight I
+    # found that we failed here due to a transient network error. As a
+    # result, I'm including a limited number of retries to try to
+    # recover from that scenario.
+
+    my $tries = 3;
+    my ($content_type, $document_length, $modified_time,
+	$expires, $server);
+    while ($tries--) {
+      ($content_type, $document_length, $modified_time, $expires, $server)
+	= head($url);
+      #warn "Got length $document_length!\n" if defined($document_length);
+      last if defined($document_length);
+    }
+
+    if (defined($document_length)) {
       #warn "Adding file info for $rel\n";
       $fields[0]            = $rel;
       @fields[CMTIME,CSIZE] = ($modified_time,$document_length);
       print $fh join("\0",@fields) . "\n";
+    } else {
+      die "Failed to get header info for $url\n" unless $tries;
     }
-
   };
 
   do_diff(
@@ -1665,8 +1719,7 @@ sub crontask_local {
        my @A = split("\0",$a);
        my $f = SRCROOT . $A[0];
 
-       # skip directories (writing original record back out
-       # unmodified)
+       # skip directories, writing original record back out unmodified
        if ($a =~ m|/$|) {
 	 print $fh "$a\n";
 	 return;
@@ -1690,15 +1743,41 @@ sub crontask_local {
 	 goto cleanup;
        }
 
-       # make
-       make_torrent_file(infile => $f);
+       my $action = file_disposition($f);
 
-       # publish
-       publish_torrent(file => $f);
+       if ($action eq "copy") {
 
-       # start
-       start_torrent($f);
+	 warn "copy: $f\n";
 
+	 my $web_file = $f;
+	 substr($web_file,0,length SRCROOT,WEBROOT);
+
+	 my $web_dir = $web_file;
+	 $web_dir =~ s|^(.*)/.*$|$1|;
+
+	 unless(newer_target($f,$web_file)) {
+	   make_path($web_dir) unless -d $web_dir;
+	   cp $f, $web_file or warn "failed to copy '$f' to '$web_file'\n";
+	 }
+
+       } elsif ($action eq "torrent") {
+
+	 warn "make/publish/start: $f\n";
+
+	 # make
+	 make_torrent_file(infile => $f);
+
+	 # publish
+	 publish_torrent(file => $f);
+
+	 # start
+	 start_torrent($f);
+
+       } else {
+
+	 die "Unknown disposition '$action' for file $f\n";
+
+       }
 
        # write the record plus any updates back out to the cache file
      cleanup:
@@ -1712,6 +1791,113 @@ sub crontask_local {
   # rebuild index.html files
 
 }
+
+
+# a routine to decide whether we should make a torrent file for a file
+# from the main server, or simply copy it through directly (actually,
+# link it, to save space) into our web space. Returns either "torrent"
+# or "copy" for a given file or '' if we have no way of dealing with
+# it (eg, input file is actually a dir).
+sub file_disposition {
+
+  my $file = abs_path(shift);
+
+  die "input file $file is not in our download dir\n" unless
+    (SRCROOT eq substr $file, $[, $[ + length SRCROOT);
+
+  return '' if -d $file or ! -f $file;
+
+  my $size = (stat(_))[SSIZE];
+
+  # some simple rules
+  return "copy" if $file =~ /^md5sum/;
+  return "copy" if $file =~ /md5sums?$/;
+
+  return "copy" if $size < (100 * 1024);
+
+  return "torrent";
+
+}
+
+# lint goes through the list of files collected by spider and prints a
+# list of all of those that haven't been properly "published". It
+# prints a 2-letter status for each of these files:
+# dl - file still needs to be downloaded (using do_mirror)
+# cp - file is stored locally, but should be copied to web dir
+# bt - file is stored locally, but we should publish a torrent for it
+#
+# In the normal run of things, running crontask should make sure that
+# all files are downloaded and either copied directly (as in the case
+# of small files like .md5sum files) or converted into a torrent.
+# However, if something goes wrong with that, or if we've been doing
+# the publishing manually and forgot to keep up to date with new files
+# on the main server then this command will find the files that need
+# some action to be taken.
+sub lint {
+
+  my $rooturl = shift;
+  $rooturl = ODROIDROOTURL unless defined($rooturl);
+
+  #die "Modules required to mirror are not available!\n"
+  #  unless $spider_support;
+
+  unless (ODROIDROOTURL eq substr $rooturl, $[, $[ + length ODROIDROOTURL) {
+    die "lint: expected URL starting with " . ODROIDROOTURL . "\n";
+  }
+
+  do_diff
+    (
+     # all our work is done in insert_a callback (default callbacks
+     # and other options work fine for us)
+     insert_a => sub {
+       my $filerec = shift;
+       my ($rel,$mtime,$size) = (split "\0", $filerec)[0,CMTIME,CSIZE];
+
+       my $file = SRCROOT . $rel;
+       my $url  = ODROIDROOTURL . $rel;
+
+       # ignore dir names
+       return if $file =~ /\/$/;
+
+       # a file needs downloading if it's too small or a newer version
+       # exists on the main server. Copy/paste from do_mirror, with
+       # slight change.
+       my $need_download = 1;
+       my ($local_mtime,$local_size)=(0,0);
+       if (-f $file) {
+	 ($local_mtime,$local_size) = (stat(_))[SMTIME,SSIZE];
+	 if ($local_size == $size and $local_mtime >= $mtime) {
+	   $need_download = 0;
+	 }
+       }
+       if ($need_download) {
+	 print "DL $file\n";
+	 return;
+       }
+
+       my $action = file_disposition($file);
+
+       my $web_file = $file;
+       substr($web_file,0,length SRCROOT,WEBROOT);
+
+       my $status = "??";
+       if ($action eq "torrent") {
+	 $web_file .= ".torrent";
+	 $status = "BT";
+       } elsif ($action eq "copy") {
+	 $status = "CP";
+       } else {
+	 print "?? $file\n";
+	 return;
+       }
+
+       return if newer_target($file,$web_file);
+       print "$status $file\n";
+
+     },
+    );
+}
+
 
 
 my $prog = $0; $prog =~ s|.*/||;
@@ -1906,6 +2092,7 @@ if ($command eq "make") {
 
   # copy this script to the bin dir of each slave machine
   for my $m (@slaves) {
+    print "copying to $m\n";
     `scp $0 $m:bin/`;
   }
 
@@ -1964,10 +2151,19 @@ if ($command eq "make") {
   download_url(url => 'http://euler/10Mb', file => './10Mb', verbose => 1) 
     || warn "total failure\n";
 
+} elsif ($command eq "lint") {	# list all files that need publishing
+
+  lint;
+
+
 } elsif ($command eq "crontask") {
 
   crontask_remote;
   crontask_local;
+
+} elsif ($command eq "cronremote") {
+
+  crontask_remote;
 
 } elsif ($command eq "cronlocal") {
 
